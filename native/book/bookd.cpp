@@ -21,6 +21,11 @@
 //     7 GET     u64 id
 //     8 STAT
 //     9 SYNC                                    (fsync the journal and reply; for a clean handover)
+//    10 COMMIT  u32 n, n × (u8 kind, body)       the incremental state commitment (commit.hpp): a whole batch of
+//               kind 1 INSERT hash[32] user[20] u8 buy price[32] remaining[32] u64 seq      tree updates in ONE
+//               kind 2 REMOVE hash[32]                                                      request, applied in
+//               kind 3 SET    hash[32] remaining[32]                                        order; n may be 0
+//    11 CPROOF  hash[32]                         the inclusion proof of one resting order against the root
 //   reply    := u8 op, u8 status (0 ok, 1 bad request), u64 seq, body
 //     1 ADD     u64 rem_lo, u64 rem_hi, u32 nfills, u8 rested, u8 reason,
 //               nfills × (u64 seq, u64 maker_id, u64 taker_id, u64 maker_user, u64 taker_user, i64 tick,
@@ -34,12 +39,17 @@
 //     8 STAT    u64 resting, u64 state_hash, u64 book_hash, u64 journal_records, u64 adds, u64 fills,
 //               u64 cancels, u64 rejects, i64 tick_size, i64 tick_limit
 //     9 SYNC    u64 journal_records
+//    10 COMMIT  u32 applied, u32 refused, u8 root[32], u64 size   (the root AFTER the updates: a root read is
+//               a COMMIT with n = 0, and a batch's flush reads the root in the same round trip)
+//    11 CPROOF  i32 len (-1: unknown hash), u8 proof[len]          (the wire form of commit.hpp: leaf ‖ left ‖ right ‖ n × (dir ‖ leaf ‖ sibling))
 //     ORDER     := u8 found, u64 id, u64 user, u64 seq, i64 tick, u64 size_lo, u64 size_hi, u64 rem_lo,
 //                  u64 rem_hi, u32 flags, u8 buy
 //
 //   ./bookd --listen /tmp/book.sock [--journal path] [--fsync 0|1] [--tick-size N] [--tick-cap N] [--tick-limit N]
 //   ./bookd --fifo req res [...]            ./bookd --stdio [...]
 #include "book.hpp"
+#include "commit.hpp"
+#include <memory>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -57,7 +67,8 @@
 using namespace rollbook;
 using u8 = uint8_t;
 
-enum Op : u8 { OP_ADD = 1, OP_CANCEL = 2, OP_DEPTH = 3, OP_BEST = 4, OP_ORDERS = 5, OP_PREVIEW = 6, OP_GET = 7, OP_STAT = 8, OP_SYNC = 9 };
+enum Op : u8 { OP_ADD = 1, OP_CANCEL = 2, OP_DEPTH = 3, OP_BEST = 4, OP_ORDERS = 5, OP_PREVIEW = 6, OP_GET = 7, OP_STAT = 8, OP_SYNC = 9, OP_COMMIT = 10, OP_CPROOF = 11 };
+enum CommitKind : u8 { CK_INSERT = 1, CK_REMOVE = 2, CK_SET = 3 };
 
 // ---------------------------------------------------------------- little-endian framing
 struct Rd {
@@ -66,6 +77,8 @@ struct Rd {
   u32 g32() { if (i + 4 > n) { ok = false; return 0; } u32 v = 0; for (int k = 0; k < 4; ++k) v |= (u32)p[i + k] << (8 * k); i += 4; return v; }
   u64 g64() { if (i + 8 > n) { ok = false; return 0; } u64 v = 0; for (int k = 0; k < 8; ++k) v |= (u64)p[i + k] << (8 * k); i += 8; return v; }
   i64 gi64() { return (i64)g64(); }
+  /// `k` raw bytes (hashes, addresses and the big-endian 256-bit words of the commit tree)
+  const u8* raw(size_t k) { if (i + k > n) { ok = false; return nullptr; } const u8* q = p + i; i += k; return q; }
 };
 struct Wr {
   std::vector<u8>& b;
@@ -74,6 +87,7 @@ struct Wr {
   void p64(u64 v) { for (int k = 0; k < 8; ++k) b.push_back((u8)(v >> (8 * k))); }
   void pi64(i64 v) { p64((u64)v); }
   void p128(u128 v) { p64((u64)v); p64((u64)(v >> 64)); }
+  void raw(const u8* p, size_t k) { b.insert(b.end(), p, p + k); }
 };
 
 // ---------------------------------------------------------------- journal
@@ -160,7 +174,13 @@ static u64 replay(const std::string& path, Book& book, i64 tick_size, i64 tick_l
 struct Server {
   Book book;
   Journal jrn;
+  // the incremental state commitment (commit.hpp), one per process, created at the first COMMIT request so a
+  // bookd that is only a book pays nothing for it. It is NOT journalled: it is derived state — the miner's
+  // batch journal and the engine's order journal rebuild it through the same events on a restart — and the
+  // shard that owns it (a shard holds several books) runs its own bookd for it with `--journal none`.
+  std::unique_ptr<rollcommit::CommitTree> commit;
   Server(i64 ts, i64 cap, i64 lim) : book(ts, cap, lim, 1u << 16) {}
+  rollcommit::CommitTree& tree() { if (!commit) commit = std::make_unique<rollcommit::CommitTree>(1u << 16); return *commit; }
 
   static void put_order(Wr& w, bool found, u64 id, u64 user, u64 seq, i64 tick, u128 size, u128 rem, u32 flags, bool buy) {
     w.p8(found ? 1 : 0); w.p64(id); w.p64(user); w.p64(seq); w.pi64(tick); w.p128(size); w.p128(rem); w.p32(flags); w.p8(buy ? 1 : 0);
@@ -228,6 +248,47 @@ struct Server {
         w.pi64(book.tick_size()); w.pi64(book.tick_limit());
         break;
       case OP_SYNC: w.p64(jrn.records); break;
+      case OP_COMMIT: {
+        // a whole batch of tree updates in one frame, applied in order; the reply is the root after all of them.
+        // The frame is parsed completely before anything is applied, so a malformed one changes nothing.
+        u32 n = r.g32(); if (!r.ok) { out[at + 4 + 1] = 1; break; }
+        rollcommit::CommitTree& t = tree();
+        u32 applied = 0, refused = 0;
+        size_t start = r.i;
+        for (u32 k = 0; k < n && r.ok; ++k) {
+          u8 kind = r.g8();
+          if (kind == CK_INSERT) { r.raw(32 + 20); r.g8(); r.raw(64); r.g64(); }
+          else if (kind == CK_REMOVE) r.raw(32);
+          else if (kind == CK_SET) r.raw(64);
+          else r.ok = false;
+        }
+        if (!r.ok || r.i != len) { out[at + 4 + 1] = 1; break; }
+        r.i = start;
+        for (u32 k = 0; k < n; ++k) {
+          u8 kind = r.g8();
+          bool ok;
+          if (kind == CK_INSERT) {
+            rollcommit::Entry e;
+            memcpy(e.hash, r.raw(32), 32); memcpy(e.user, r.raw(20), 20); e.buy = r.g8() != 0;
+            memcpy(e.price, r.raw(32), 32); memcpy(e.remaining, r.raw(32), 32); e.seq = r.g64();
+            ok = t.insert(e);
+          } else if (kind == CK_REMOVE) ok = t.remove(r.raw(32));
+          else { const u8* h = r.raw(32); const u8* rem = r.raw(32); ok = t.set_remaining(h, rem); }
+          if (ok) ++applied; else ++refused;
+        }
+        u8 root[32]; t.root(root);
+        w.p32(applied); w.p32(refused); w.raw(root, 32); w.p64((u64)t.size());
+        break;
+      }
+      case OP_CPROOF: {
+        const u8* h = r.raw(32); if (!r.ok) { out[at + 4 + 1] = 1; break; }
+        rollcommit::Proof p;
+        if (!commit || !commit->proof(h, p)) { w.p32(0xFFFFFFFFu); break; }
+        size_t n = rollcommit::proof_bytes(p);
+        std::vector<u8> buf(n); rollcommit::proof_write(p, buf.data());
+        w.p32((u32)n); w.raw(buf.data(), n);
+        break;
+      }
       default: out[at + 4 + 1] = 1; break;
     }
     u64 s = book.seq();
@@ -280,9 +341,9 @@ static void serve(Server& srv, int rfd, int wfd, bool quiet) {
     if (!write_all(wfd, out.data(), out.size())) break;
   }
   if (!quiet)
-    fprintf(stderr, "bookd: connection closed · %llu requests in %llu batches (%.1f per batch) · seq %llu · resting %zu · transcript %016llx\n",
+    fprintf(stderr, "bookd: connection closed · %llu requests in %llu batches (%.1f per batch) · seq %llu · resting %zu · transcript %016llx · commit tree %zu\n",
             (unsigned long long)nreq, (unsigned long long)nbatch, nbatch ? (double)nreq / (double)nbatch : 0.0,
-            (unsigned long long)srv.book.seq(), srv.book.size(), (unsigned long long)srv.book.state_hash());
+            (unsigned long long)srv.book.seq(), srv.book.size(), (unsigned long long)srv.book.state_hash(), srv.commit ? srv.commit->size() : (size_t)0);
 }
 
 int main(int argc, char** argv) {

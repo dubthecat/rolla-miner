@@ -16,15 +16,24 @@
 // Prices: the native book is a tick grid. A price that is not a multiple of tickSize (default 1e14 = 0.0001)
 // is refused with reason 'off tick' instead of being silently rounded. The JS matcher accepts any bigint, so
 // this is the one semantic difference between the two backends, and it is deliberate.
+//
+// createNativeCommit() is the second client in this file: the shard's incremental state commitment
+// (native/book/commit.hpp, L3-NATIVE-BOOK.md §9) served by the same bookd behind OP_COMMIT / OP_CPROOF. Its
+// updates are BUFFERED and go out as one request per flush — a whole batch's inserts, fills and cancels in a
+// few frames and one round trip, the root read in the same reply — because the round trip (~25 µs) is what
+// the process boundary costs and a 2,000-op batch must not pay it 2,000 times. It is owned by
+// engine/l3/miner/commit-state.js, which decides between it and the in-process JS tree.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { decodeCommitProof } from './miner/commit.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.resolve(HERE, '../native/book/bookd');
-const OP = { ADD: 1, CANCEL: 2, DEPTH: 3, BEST: 4, ORDERS: 5, PREVIEW: 6, GET: 7, STAT: 8, SYNC: 9 };
+const OP = { ADD: 1, CANCEL: 2, DEPTH: 3, BEST: 4, ORDERS: 5, PREVIEW: 6, GET: 7, STAT: 8, SYNC: 9, COMMIT: 10, CPROOF: 11 };
+const CK = { INSERT: 1, REMOVE: 2, SET: 3 };
 const REASON = [null, 'duplicate', 'bad order', 'would cross', 'off tick', 'price out of range', 'size overflow', 'book full'];
 const NO_TICK = -(2n ** 63n);
 const SLEEP = new Int32Array(new SharedArrayBuffer(4));
@@ -37,6 +46,14 @@ class Frame {                      // a growable little-endian writer
   u64(v) { this.need(8); this.b.writeBigUInt64LE(BigInt(v) & 0xffffffffffffffffn, this.i); this.i += 8; return this; }
   i64(v) { this.need(8); this.b.writeBigInt64LE(BigInt(v), this.i); this.i += 8; return this; }
   u128(v) { return this.u64(BigInt(v) & 0xffffffffffffffffn).u64(BigInt(v) >> 64n); }
+  raw(u) { this.need(u.length); this.b.set(u, this.i); this.i += u.length; return this; }
+  /// a 256-bit unsigned as 32 big-endian bytes (what commit.hpp's Entry carries for price and remaining)
+  u256be(v) {
+    this.need(32); let x = BigInt(v);
+    if (x < 0n || x >> 256n) throw new Error('u256 out of range');
+    for (let k = 3; k >= 0; k--) { this.b.writeBigUInt64BE(x & 0xffffffffffffffffn, this.i + 8 * k); x >>= 64n; }
+    this.i += 32; return this;
+  }
   done() { return this.b.subarray(0, this.i); }
 }
 class Cursor {                     // a little-endian reader over one reply payload
@@ -46,6 +63,7 @@ class Cursor {                     // a little-endian reader over one reply payl
   u64() { const v = this.b.readBigUInt64LE(this.i); this.i += 8; return v; }
   i64() { const v = this.b.readBigInt64LE(this.i); this.i += 8; return v; }
   u128() { const lo = this.u64(), hi = this.u64(); return (hi << 64n) | lo; }
+  raw(n) { const u = new Uint8Array(this.b.buffer, this.b.byteOffset + this.i, n).slice(); this.i += n; return u; }
 }
 
 /// a bookd process plus the synchronous framing over its FIFOs
@@ -60,6 +78,9 @@ function connect({ bin = BIN, dir = null, journal = null, tickSize = 10n ** 14n,
   if (!fsync) args.push('--fsync', '0');
   const child = spawn(bin, args, { stdio: ['ignore', 'ignore', log ? 'pipe' : 'ignore'] });
   if (log && child.stderr) child.stderr.on('data', (d) => log(`[bookd] ${String(d).trim()}`));
+  // a helper process must never keep this one alive: a book or a commit tree nobody closed would otherwise hold
+  // the event loop open after the last test (bookd exits by itself when our end of its request FIFO goes away)
+  child.unref(); if (child.stderr) child.stderr.unref?.();
   // open our write end first (O_RDWR never blocks on a FIFO), then the read end non-blocking so a dead bookd
   // surfaces as an error instead of a hang
   const reqFd = fs.openSync(req, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
@@ -165,11 +186,14 @@ export function createNativeBook(opts = {}) {
       const fseq = r.c.u64(), makerId = r.c.u64(), takerId = r.c.u64(), makerUid = r.c.u64(), takerUid = r.c.u64();
       const tick = r.c.i64(), size = r.c.u128(), makerRem = r.c.u128(), takerBuys = r.c.u8() === 1;
       fills.push({ seq: Number(fseq), makerHash: hashes.get(makerId), takerHash: hashes.get(takerId),
-                   maker: users.get(makerUid), taker: users.get(takerUid), price: px(tick), size, takerBuys });
+                   maker: users.get(makerUid), taker: users.get(takerUid), price: px(tick), size, takerBuys, makerRemaining: makerRem });
       if (makerRem === 0n) { drop(makerId); resting--; }
     }
     if (rested) resting++; else if (reason !== 1) drop(idOf(o.hash));   // a duplicate must keep the resting order's id
-    return { fills, rested, remaining, reason: REASON[reason] ?? null };
+    // the order's own sequence number: the book numbers the order before its fills (book.cpp add()), and the
+    // reply's seq is the book's after them. 0 when the order was never numbered (duplicate, bad, off tick).
+    const own = reason === 0 || reason === 3 ? Number(r.seq) - nfills : 0;
+    return { fills, rested, remaining, reason: REASON[reason] ?? null, seq: own };
   }
 
   function add(o) {
@@ -248,3 +272,57 @@ export function createNativeBook(opts = {}) {
            close: io.close, dir: io.dir, native: true,
            get size() { return resting; }, get seq() { return Number(seq); } };
 }
+
+// ------------------------------------------------------------------------------------- the commit tree client
+/**
+ * createNativeCommit({ bin?, dir?, log?, flushAt? }) — native/book/commit.hpp behind bookd, buffered.
+ *
+ *   insert(e)              e: { hash, user, buy, price, remaining, seq } — a resting order (restingLeaf's fields)
+ *   remove(hash)           a cancel that hit, or a maker filled out
+ *   setRemaining(hash, r)  a partial maker fill
+ *   flush()                send what is buffered: as many frames as needed (≤ flushAt updates each, well under
+ *                          bookd's 1 MiB frame cap), ONE round trip; returns { applied, refused, root, size }
+ *   root()                 flush + the root, in the same round trip (a COMMIT with the buffered updates, or n = 0)
+ *   proof(hash)            flush, then the inclusion proof as commit.js's decodeCommitProof shapes it, or null
+ *   size()                 flush + the tree's size
+ *   close()
+ *
+ * The buffer is a plain ordered list; coalescing (a fill after an insert of the same order in one batch, an
+ * insert cancelled within the batch) is commit-state.js's job, where it is shared with the JS tree.
+ */
+export function createNativeCommit({ bin = BIN, dir = null, log = null, flushAt = 4000, timeoutMs = 30000 } = {}) {
+  const io = connect({ bin, dir, journal: 'none', log, timeoutMs });   // no book, no journal: the tree is derived state
+  let frames = [], cur = null, n = 0, buffered = 0, last = { applied: 0, refused: 0, root: ZERO32_HEX, size: 0 };
+  const hashBytes = (h) => { const u = Buffer.from(String(h).startsWith('0x') ? h.slice(2) : h, 'hex'); if (u.length !== 32) throw new Error(`commit: hash of ${u.length} bytes`); return u; };
+  const userBytes = (a) => { const u = Buffer.from(String(a).startsWith('0x') ? a.slice(2) : a, 'hex'); if (u.length !== 20) throw new Error(`commit: user of ${u.length} bytes`); return u; };
+  function frame() { if (!cur) { cur = new Frame(1 << 16); cur.u8(OP.COMMIT).u32(0); n = 0; } return cur; }
+  function seal() { if (cur) { cur.b.writeUInt32LE(n, 1); frames.push(cur.done()); cur = null; n = 0; } }
+  const bump = () => { buffered++; if (++n >= flushAt) seal(); };
+  function insert(e) { frame().u8(CK.INSERT).raw(hashBytes(e.hash)).raw(userBytes(e.user)).u8(e.buy ? 1 : 0).u256be(e.price).u256be(e.remaining).u64(e.seq); bump(); }
+  function remove(hash) { frame().u8(CK.REMOVE).raw(hashBytes(hash)); bump(); }
+  function setRemaining(hash, remaining) { frame().u8(CK.SET).raw(hashBytes(hash)).u256be(remaining); bump(); }
+  /// everything buffered, in one round trip; an empty buffer still asks for the root
+  function flush() {
+    seal();
+    if (!frames.length) frames.push(new Frame(8).u8(OP.COMMIT).u32(0).done());
+    const replies = io.call(frames); frames = []; buffered = 0;
+    let applied = 0, refused = 0, root = ZERO32_HEX, size = 0;
+    for (const r of replies) {
+      if (r.status !== 0) throw new Error('bookd refused a COMMIT frame');
+      applied += r.c.u32(); refused += r.c.u32(); root = '0x' + Buffer.from(r.c.raw(32)).toString('hex'); size = Number(r.c.u64());
+    }
+    last = { applied, refused, root, size };
+    return last;
+  }
+  function root() { return flush().root; }
+  function size() { return flush().size; }
+  function proof(hash) {
+    flush();
+    const r = io.call([new Frame(40).u8(OP.CPROOF).raw(hashBytes(hash)).done()])[0];
+    if (r.status !== 0) throw new Error('bookd refused a CPROOF frame');
+    const len = r.c.u32(); if (len === 0xffffffff) return null;
+    return decodeCommitProof(r.c.raw(len), String(hash).toLowerCase());
+  }
+  return { insert, remove, setRemaining, flush, root, size, proof, close: io.close, native: true, get buffered() { return buffered; }, get last() { return last; } };
+}
+const ZERO32_HEX = '0x' + '00'.repeat(32);

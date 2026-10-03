@@ -43,7 +43,7 @@ test('queued batches carry the commitment of their own ops: one miner, slow log,
   const epochEnds = sealed.filter((b) => b.bookHash !== '0x' + '0'.repeat(64)); assert.ok(epochEnds.length >= 5, 'no epoch commitments');
   assert.equal(miner.state.bookHash(), state.bookHash());
   for (let i = 1; i < sealed.length; i++) assert.equal(sealed[i].seqFrom, sealed[i - 1].seqTo + 1, `seq range gap at ${i}`);
-  await miner.stop?.(); await seq.stop();
+  await miner.stop?.(); await seq.stop(); state.close();
 });
 
 test('the append pipeline: seals overlap the log round trip, the log stays in index order, and a refusing log is retried in order', async () => {
@@ -87,5 +87,5 @@ test('the append pipeline: seals overlap the log round trip, the log stays in in
   for (let i = 0; i < 10 && seq.status().retry; i++) { await seq.flush(); await new Promise((r) => setTimeout(r, RTT)); }
   assert.equal(seq.status().retry, 0, 'retry drained');
   const all = await base.read(ordersTopic(SHARD + 1), 0, 100); assert.deepEqual(all.map((r) => r.value.index), [...Array(27).keys()], 'log order after the outage');
-  await seq.stop(); await base.close?.();
+  await seq.stop(); state.close(); await base.close?.();
 });

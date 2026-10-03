@@ -23,6 +23,11 @@
 //   L3_THRESHOLD      how many agreeing miners this miner considers final (its own view; default 2)
 //   L3_VERIFY_WORKERS signature-verification threads (default min(4, cpus−1); 0 = in this thread)
 //   L3_NATIVE=1       replay in native/book/bookd instead of the JS matcher (tick-grid markets only)
+//   L3_COMMIT         bookhash (default) | tree — the epoch book commitment (miner/commit-state.js). MUST match the
+//                     sequencer's: the two are different words for the same book, so a mismatch is a dissent on
+//                     every epoch batch. tree = the incremental Merkle-treap, a root read at the boundary.
+//   L3_COMMIT_NATIVE=1 keep the tree in bookd (one --journal none process; L3_NATIVE=1 implies it); L3_COMMIT_FLUSH
+//                     buffered updates that force a flush before the batch ends (default 4000)
 //   RPC / RPC2        optional: with PREDICT_DESK_V2, session-key grants are checked on chain instead of trusted
 //   PORT              /healthz and /metrics (default 8090)
 //   --once            replay what is in the log, print one status line, exit 0 if healthy

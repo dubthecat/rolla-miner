@@ -266,15 +266,18 @@ test('quorum: votes that arrive before the batch are judged when it does', async
 // One sequencer and three miners over one FileLog, 2,000 signed orders from the workload generator of
 // matcher.test.mjs (same LCG, same 10% cancels / 30% crossing / 10% IOC mix). Everything here is in one
 // process, but nothing in the code knows that: the miners talk to the sequencer only through the log.
-test('a cluster of 1 sequencer and 3 miners finalizes every batch, catches a tampered miner, and recovers from a journal', async () => {
+/// the cluster scenario, parameterised by the epoch book commitment (`commit`: 'bookhash', the default protocol,
+/// or 'tree', the incremental commitment of commit-state.js) so the same run proves the same properties under both
+async function clusterScenario({ commit = 'bookhash', tag = 'cluster' } = {}) {
   const { privateKeyToAccount, generatePrivateKey } = await import('viem/accounts');
   const { BOOK_DOMAIN, L3_ORDER_TYPES, l3OrderFor, serializeL3Order } = await import('../desk.js');
   const { createSequencer } = await import('./sequencer.js');
   const { createMiner, createShardState } = await import('./miner.js');
+  const { createCommitTree } = await import('./commit.js');
 
   const SHARD = '4242', MARKET = 4242, OUTCOME = 0, N = 2000;
   const E = 10n ** 18n;
-  const dir = tmp('cluster');
+  const dir = tmp(tag);
   const domain = BOOK_DOMAIN(46630, '0x' + 'b0'.repeat(20));
   const token = '0x' + 'c0'.repeat(20);
   const traders = Array.from({ length: 8 }, () => privateKeyToAccount(generatePrivateKey()));
@@ -315,11 +318,20 @@ test('a cluster of 1 sequencer and 3 miners finalizes every batch, catches a tam
   // ---- the log, the sequencer, the three miners, and an engine-side quorum reading both topics ----
   const log = createFileLog({ dir: path.join(dir, 'log'), pollMs: 2 });
   const seqAcct = privateKeyToAccount(generatePrivateKey());
-  const state = createShardState({});
+  const state = createShardState({ commit });
   const sealed = [];
   const seq = createSequencer({ shard: SHARD, log, account: seqAcct, state, batchMs: 40, batchMax: 250, epochBatches: 4,
     onSealed: (b) => sealed.push(b), logger: () => {} });
   await seq.resume();
+  // under the tree: every commitment the sequencer takes is checked, at the moment it takes it, against a treap
+  // rebuilt from nothing over the resting orders of that same moment — the state a queued batch's bookHash
+  // describes is the state when it closed, which is why the snapshot is taken inside the call
+  const snaps = [];
+  if (commit === 'tree') {
+    assert.equal(state.commit.mode, 'tree'); assert.ok(['js', 'native'].includes(state.commit.impl), state.commit.impl);   // native under L3_COMMIT_NATIVE=1 / L3_NATIVE=1
+    const real = state.bookHash;
+    state.bookHash = () => { const h = real(); const t = createCommitTree(); for (const o of state.resting()) assert.equal(t.insert(o), true); snaps.push({ h, scratch: t.root(), resting: state.size }); return h; };
+  }
 
   const finals = [];
   const quorum = createQuorum({ threshold: 3, onFinal: (f) => finals.push(f), logger: () => {} });
@@ -332,7 +344,7 @@ test('a cluster of 1 sequencer and 3 miners finalizes every batch, catches a tam
   for (let i = 0; i < 3; i++) {
     const account = privateKeyToAccount(keys[i]);
     votesSeen.set(account.address.toLowerCase(), []);
-    const m = createMiner({ shard: SHARD, log, account, domain, dir: path.join(dir, `miner${i + 1}`), workers: 2,
+    const m = createMiner({ shard: SHARD, log, account, domain, dir: path.join(dir, `miner${i + 1}`), workers: 2, commit,
       sequencers: [seqAcct.address], threshold: 3, watchVotes: false, logger: () => {},
       onVote: (v) => votesSeen.get(account.address.toLowerCase()).push(v) });
     await m.start();
@@ -385,8 +397,27 @@ test('a cluster of 1 sequencer and 3 miners finalizes every batch, catches a tam
     assert.equal(m.metrics().dissents, 0);
     assert.equal(m.metrics().badSigs, 0);
   }
-  const epochs = sealed.filter((b) => b.bookHash !== ZERO32).length;
+  const epochBatches = sealed.filter((b) => b.bookHash !== ZERO32);
+  const epochs = epochBatches.length;
   assert.ok(epochs >= 1, 'no epoch boundary carried a book commitment');
+  if (commit === 'tree') {
+    // the epoch bookHash IS the tree root, and the tree root IS the treap over the resting orders — at every boundary
+    assert.ok(snaps.length >= epochs, `the sequencer took ${snaps.length} commitments for ${epochs} epoch batches`);
+    for (let i = 0; i < epochs; i++) {
+      assert.equal(epochBatches[i].bookHash, snaps[i].h, `epoch batch ${epochBatches[i].index} carries a different commitment than the sequencer took`);
+      assert.equal(snaps[i].h, snaps[i].scratch, `epoch batch ${epochBatches[i].index}: the tree root is not the treap rebuilt over the ${snaps[i].resting} resting orders`);
+      assert.notEqual(snaps[i].h, ZERO32);
+    }
+    const scratchNow = (() => { const t = createCommitTree(); for (const o of state.resting()) t.insert(o); return t.root(); })();
+    assert.equal(seqBook, scratchNow);
+    assert.notEqual(seqBook, bookHashOf(state.resting()), 'tree mode is a different commitment than bookhash mode');
+    for (const m of miners) {
+      assert.equal(m.bookHash, epochBatches[epochs - 1].bookHash, 'the miner\'s last epoch commitment is not the chain\'s');
+      const cs = m.state.commit.stats();
+      assert.equal(cs.mode, 'tree'); assert.equal(cs.refused, 0, `miner ${m.address} had ${cs.refused} refused commitment updates`); assert.equal(cs.conflicts, 0);
+      assert.ok(cs.applied > 0 && cs.applied <= cs.ops);
+    }
+  }
 
   // ---- a challenge proof: one fill of the last batch, against that batch's fillsRoot ----
   const proof = miners[0].proveFill(lastIndex, () => true);
@@ -404,30 +435,34 @@ test('a cluster of 1 sequencer and 3 miners finalizes every batch, catches a tam
   // would only make the test slower. Every other miner here does the real work.
   const stub = { workers: 0, stats: () => ({}), close: async () => {},
     verifyOrders: async (items) => items.map((it) => ({ hash: orderHash(domain, it.order), signer: String(it.order.user).toLowerCase() })) };
-  const bad = createMiner({ shard: SHARD, log, account: badAcct, domain, dir: path.join(dir, 'miner-bad'), verifier: stub,
+  // the lie is told once, in the first batch from index 2 on that HAS fills: where a batch closes is the timer's
+  // and the batchMax's business, so a fixed index could land on a small batch with nothing to tamper with
+  let tamperedAt = -1;
+  const bad = createMiner({ shard: SHARD, log, account: badAcct, domain, dir: path.join(dir, 'miner-bad'), verifier: stub, commit,
     sequencers: [seqAcct.address], threshold: 3, watchVotes: false, logger: () => {},
-    tamper: (batch, fills) => (Number(batch.index) === 2 && fills.length ? fills.slice(1) : fills) });
+    tamper: (batch, fills) => { if (tamperedAt < 0 && Number(batch.index) >= 2 && fills.length) { tamperedAt = Number(batch.index); return fills.slice(1); } return fills; } });
   await bad.start();
   const oVotes = await log.subscribe(votesTopic(SHARD), 0, async ({ value }) => { await observer.vote(value); });
   const dl2 = Date.now() + 120000;
   while (Date.now() < dl2 && bad.index < lastIndex) await new Promise((r) => setTimeout(r, 10));
   assert.equal(bad.index, lastIndex);
-  assert.equal(bad.metrics().dissents, 1, 'the tampered miner did not dissent exactly once');
+  assert.ok(tamperedAt >= 2 && tamperedAt < lastIndex, `nothing to tamper with (tampered at ${tamperedAt} of ${lastIndex})`);
+  assert.equal(bad.metrics().dissents, 1, `the tampered miner dissented ${bad.metrics().dissents} times, not once (tampered batch ${tamperedAt})`);
   assert.equal(bad.lastVote.ok, true, 'the tamper leaked past its own batch');
-  const dis = observed.find((f) => f.index === 2 && f.why === 'a miner disagrees with the sequencer');
-  assert.ok(dis, `no dissent fork was raised: ${JSON.stringify(observed.map((f) => f.why))}`);
+  const dis = observed.find((f) => f.index === tamperedAt && f.why === 'a miner disagrees with the sequencer');
+  assert.ok(dis, `no dissent fork was raised at ${tamperedAt}: ${JSON.stringify(observed.map((f) => [f.index, f.why]))}`);
   assert.equal(dis.miner, badAcct.address.toLowerCase());
   assert.notEqual(dis.got, dis.claimed);
   assert.equal(observer.halted, true, 'the observer did not halt on the fork');
-  assert.equal(observer.at(2).dissent.length, 1);
-  assert.equal(observer.at(2).agree.length, 3, 'the honest three were not still counted');
+  assert.equal(observer.at(tamperedAt).dissent.length, 1);
+  assert.equal(observer.at(tamperedAt).agree.length, 3, 'the honest three were not still counted');
   await bad.stop(); oOrders.close(); oVotes.close();
 
   // ---- a miner restarted from its journal catches up to the same book hash ----
   const m2 = miners[1];
   const before = { index: m2.index, book: m2.state.bookHash(), votes: m2.metrics().votes };
   await m2.stop();
-  const revived = createMiner({ shard: SHARD, log, account: privateKeyToAccount(keys[1]), domain,
+  const revived = createMiner({ shard: SHARD, log, account: privateKeyToAccount(keys[1]), domain, commit,
     dir: path.join(dir, 'miner2'), workers: 0, sequencers: [seqAcct.address], threshold: 3, watchVotes: false, logger: () => {} });
   await revived.start();
   assert.equal(revived.index, before.index, 'the revived miner is at a different index');
@@ -451,27 +486,29 @@ test('a cluster of 1 sequencer and 3 miners finalizes every batch, catches a tam
   const verifyMs = miners.reduce((a, m) => a + m.metrics().verifyMs, 0);
   const verified = miners.reduce((a, m) => a + m.metrics().orders, 0);
   const fills = miners[0].metrics().fills;
-  console.log(`\n  cluster: ${N} ops (${N - cancels} signed orders, ${cancels} cancels) · ${mainBatches} batches · ${fills} fills · 1 sequencer + 3 miners over a FileLog`);
+  console.log(`\n  cluster (${commit}${commit === 'tree' ? ', ' + state.commit.impl : ''}): ${N} ops (${N - cancels} signed orders, ${cancels} cancels) · ${mainBatches} batches · ${fills} fills · 1 sequencer + 3 miners over a FileLog`);
   console.log(`  sequencing      ${seqMs.toFixed(0)} ms → ${Math.round(N / (seqMs / 1000)).toLocaleString()} orders/s (match + roots + sign + append; the engine verified the signatures before this)`);
   console.log(`  whole cluster   ${clusterMs.toFixed(0)} ms → ${Math.round(N / (clusterMs / 1000)).toLocaleString()} orders/s through sequencing AND 3 independent replays + votes`);
   console.log(`  signing (viem)  ${(signMs / N).toFixed(2)} ms/order → ${Math.round(N / (signMs / 1000)).toLocaleString()} signatures/s on one thread`);
   console.log(`  verification    ${(verifyMs / verified).toFixed(2)} ms/order of wall time per miner (${miners[0].verifier.workers} workers each), ${verified} recoveries in ${(clusterMs / 1000).toFixed(1)} s → ${Math.round(verified / (clusterMs / 1000)).toLocaleString()}/s across the cluster`);
   console.log(`                  one recovery costs 5.6 ms of a core here (docs/L3-MINERS.md §6), so ${verified} of them are ${(verified * 5.6 / 1000).toFixed(0)} core-seconds: the pool is the only reason this finishes in ${(clusterMs / 1000).toFixed(0)} s`);
-  for (const m of miners) { const x = m.metrics(); console.log(`    ${m.address.slice(0, 10)}… ${x.batches} batches · verify ${x.verifyMs.toFixed(0)} ms · match ${x.applyMs.toFixed(0)} ms · roots ${x.rootMs.toFixed(0)} ms · ${x.fills} fills`); }
+  for (const m of miners) { const x = m.metrics(); console.log(`    ${m.address.slice(0, 10)}… ${x.batches} batches · verify ${x.verifyMs.toFixed(0)} ms · match ${x.applyMs.toFixed(0)} ms · commitment ${x.commitMs.toFixed(0)} ms · roots ${x.rootMs.toFixed(0)} ms · ${x.fills} fills`); }
   const ss = seq.status();
-  console.log(`  sequencer       seal ${ss.perBatchMs} ms/batch, of which roots ${(ss.rootMs / ss.batches).toFixed(0)} ms · ${epochs} epoch boundaries carried a book commitment`);
+  console.log(`  sequencer       seal ${ss.perBatchMs} ms/batch, of which roots ${(ss.rootMs / ss.batches).toFixed(0)} ms · ${epochs} epoch boundaries carried a book commitment (${commit}${commit === 'tree' ? `: ${state.commit.stats().applied} tree updates for ${state.commit.stats().ops} events, ${state.commit.stats().ms.toFixed(0)} ms` : ''})`);
 
   for (const m of miners) await m.stop();
   qOrders.close(); qVotes.close();
-  await seq.stop(); await log.close();
+  await seq.stop(); state.close(); await log.close();
   fs.rmSync(dir, { recursive: true, force: true });
-});
+}
+test('a cluster of 1 sequencer and 3 miners finalizes every batch, catches a tampered miner, and recovers from a journal', () => clusterScenario({ commit: 'bookhash' }));
+test('L3_COMMIT=tree: the same cluster on the incremental commitment — every epoch bookHash is the tree root, equal to a treap rebuilt over the resting orders, and a revived miner rebuilds it from its journal', () => clusterScenario({ commit: 'tree', tag: 'cluster-tree' }));
 
 // --------------------------------------------------------------------------- the engine side of L3_MINERS=1
 // book.js's whole contribution is a flag, two hooks and a finality callback. This is those hooks: the rig
 // sequences what the engine already matched, a real miner votes, and the fills the engine staged under that
 // batch are released by the quorum — the path a trader's money actually takes with L3_MINERS=1.
-test('the rig sequences the engine\'s own fills and releases them on finality', async () => {
+async function rigScenario({ commit = 'bookhash' } = {}) {
   const { privateKeyToAccount, generatePrivateKey } = await import('viem/accounts');
   const { BOOK_DOMAIN, L3_ORDER_TYPES, l3OrderFor, serializeL3Order, parseL3Order } = await import('../desk.js');
   const { createSequencerRig } = await import('./sequencer.js');
@@ -483,7 +520,7 @@ test('the rig sequences the engine\'s own fills and releases them on finality', 
   const E = 10n ** 18n, MARKET = 91, SHARD = '91';
   const operator = privateKeyToAccount(generatePrivateKey());
   const minerAcct = privateKeyToAccount(generatePrivateKey());
-  const env = { L3_LOG: 'file', L3_LOG_DIR: path.join(dir, 'log'), L3_THRESHOLD: '1', L3_BATCH_MS: '20', L3_BATCH_MAX: '4', L3_EPOCH_BATCHES: '2', CHAIN_ID: '46630' };
+  const env = { L3_LOG: 'file', L3_LOG_DIR: path.join(dir, 'log'), L3_THRESHOLD: '1', L3_BATCH_MS: '20', L3_BATCH_MAX: '4', L3_EPOCH_BATCHES: '2', CHAIN_ID: '46630', L3_COMMIT: commit };
   const domain = BOOK_DOMAIN(46630, '0x' + 'b0'.repeat(20));
   const token = '0x' + 'c0'.repeat(20);
   const traders = [privateKeyToAccount(generatePrivateKey()), privateKeyToAccount(generatePrivateKey())];
@@ -502,24 +539,36 @@ test('the rig sequences the engine\'s own fills and releases them on finality', 
     sequencers: [operator.address], threshold: 1, logger: () => {}, env: { ...env, L3_REWARD_BASE: '100', L3_REWARD_PER_FILL: '1' } });
   await miner.start();
 
-  // six orders through the hooks: three bids, three crossing asks
-  for (let i = 0; i < 6; i++) {
+  // eight orders through the hooks: three bids, three crossing asks, then a bid and an ask that rest — and a
+  // cancel of one of those, so the book the commitment describes is neither empty nor untouched by a cancel.
+  // Half the adds hand the rig the book's add result as book.js does, half make it ask the book (both paths).
+  const recs = [];
+  for (let i = 0; i < 8; i++) {
     const t = traders[i % 2];
-    const o = l3OrderFor({ user: t.address, marketId: MARKET, outcome: 0, token, buy: i < 3, price: (i < 3 ? 51n : 50n) * E / 100n, size: 2n * E });
+    const buy = i < 3 || i === 6, price = i < 3 ? 51n : i < 6 ? 50n : i === 6 ? 40n : 60n;
+    const o = l3OrderFor({ user: t.address, marketId: MARKET, outcome: 0, token, buy, price: price * E / 100n, size: 2n * E });
     const sig = await t.signTypedData({ domain, types: L3_ORDER_TYPES, primaryType: 'L3Order', message: o });
     const hash = orderHash(domain, serializeL3Order(o));
     const rec = { hash, o: parseL3Order(serializeL3Order(o)), sig, signer: t.address.toLowerCase(), at: Date.now() };
     const r = b.m.add({ hash, user: o.user.toLowerCase(), buy: o.buy, price: o.price, size: o.size });
-    const slot = rig.record(b, rec, r.fills);
+    const slot = i % 2 ? rig.record(b, rec, r.fills, r) : rig.record(b, rec, r.fills);
     assert.ok(slot && slot.startsWith(`${SHARD}#`), `no slot for order ${i}: ${slot}`);
     if (r.fills.length) { const a = staged.get(slot) || []; a.push(...r.fills); staged.set(slot, a); }
+    recs.push(rec);
     await new Promise((r2) => setImmediate(r2));
   }
+  { const rec = recs[6]; const o = b.m.cancel(rec.hash); assert.ok(o, 'the 40¢ bid was not resting'); assert.ok(rig.recordCancel(b, rec, 'user', o)); }
+  assert.equal(b.m.size, 1);
   await rig.flush();
 
   const deadline = Date.now() + 60000;
   while (Date.now() < deadline && (!released.length || staged.size)) await new Promise((r) => setTimeout(r, 10));
   assert.equal(staged.size, 0, 'fills were left staged after finality');
+  // the last batch (the two resting orders and the cancel) produces no fills, so finality of the fills says
+  // nothing about it: wait for the miner to have applied every sealed batch before the books are compared
+  const lastIndex = rig.shard(SHARD).seq.index - 1;
+  while (Date.now() < deadline && miner.index < lastIndex) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(miner.index, lastIndex, `the miner is at ${miner.index} of ${lastIndex}`);
   assert.ok(released.length >= 1);
   assert.equal(released.reduce((n, r) => n + r.fills, 0), 3, 'the released fills are not the three the book made');
   for (const r of released) assert.equal(r.votes, 1);
@@ -534,10 +583,24 @@ test('the rig sequences the engine\'s own fills and releases them on finality', 
   assert.equal([...rig.shard(SHARD).books][0], b, 'the rig did not commit to the engine\'s own book');
   assert.equal(miner.metrics().dissents, 0);
   assert.equal(miner.metrics().badSigs, 0);
-  // the engine's book and the miner's book are the same book
+  // the engine's book and the miner's book are the same book, under whichever commitment
   const { bookHashOf } = await import('./merkle.js');
-  assert.equal(miner.state.bookHash(), bookHashOf(b.m.orders()), 'the miner replayed a different book than the engine matched');
+  const rigState = rig.shard(SHARD).state;
+  assert.equal(rigState.commit.mode, commit);
+  if (commit === 'tree') {
+    const { createCommitTree } = await import('./commit.js');
+    const t = createCommitTree(); for (const o of b.m.orders()) t.insert(o);
+    assert.notEqual(t.root(), ZERO32);
+    assert.equal(rigState.bookHash(), t.root(), 'the rig\'s tree is not the treap over the engine\'s book');
+    assert.equal(miner.state.bookHash(), t.root(), 'the miner\'s tree is not the treap over the engine\'s book');
+    assert.equal(rigState.commit.stats().refused, 0); assert.equal(miner.state.commit.stats().refused, 0);
+  } else assert.equal(miner.state.bookHash(), bookHashOf(b.m.orders()), 'the miner replayed a different book than the engine matched');
+  assert.equal(miner.state.bookHash(), rigState.bookHash(), 'the miner and the rig commit to different books');
+  const lastEpoch = (await log.read(ordersTopic(SHARD), 0, 100)).map((r) => r.value).filter((v) => v.bookHash !== ZERO32).pop();
+  assert.ok(lastEpoch, 'no epoch batch was sealed'); assert.equal(miner.bookHash, lastEpoch.bookHash);
 
   await miner.stop(); await log.close(); await rig.stop();
   fs.rmSync(dir, { recursive: true, force: true });
-});
+}
+test('the rig sequences the engine\'s own fills and releases them on finality', () => rigScenario({ commit: 'bookhash' }));
+test('L3_COMMIT=tree: the rig\'s commitment is fed by the engine\'s own add and cancel results and equals the miner\'s', () => rigScenario({ commit: 'tree' }));

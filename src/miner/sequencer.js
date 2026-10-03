@@ -22,9 +22,10 @@
 //                       fills belong to, which is what the engine stages them under until finality.
 import path from 'node:path';
 import { privateKeyToAccount } from 'viem/accounts';
-import { fillsRootOf, ordersRootOf, batchRootOf, epochDigestOf, bookHashOf, ZERO32 } from './merkle.js';
+import { fillsRootOf, ordersRootOf, batchRootOf, epochDigestOf, ZERO32 } from './merkle.js';
 import { signDigest } from './verify.js';
 import { createShardState } from './miner.js';
+import { createCommitState } from './commit-state.js';
 import { createQuorum } from './quorum.js';
 import { createLog, ordersTopic, votesTopic } from './log.js';
 import { rewardsFromEnv } from './rewards.js';
@@ -62,6 +63,7 @@ export function createSequencer({
   if (!log) throw new Error('a sequencer needs a log');
   if (!account?.address) throw new Error('a sequencer needs an account');
   const st = state || createShardState({ newBook, logger: logFn });
+  const ownState = !state;    // a state the sequencer made is the sequencer's to close (its books, its commit tree)
   if (typeof st.bookHash !== 'function') throw new Error('a sequencer state needs bookHash()');
   const topic = ordersTopic(shard);
   const m = { batches: 0, ops: 0, fills: 0, sealed: 0, failed: 0, retried: 0, sealMs: 0, rootMs: 0, lastSealAt: 0 };
@@ -230,7 +232,7 @@ export function createSequencer({
     status: () => ({ shard: String(shard), index, epoch, prevRoot, open: open.ops.length + queued.reduce((n, b) => n + b.ops.length, 0), queued: queued.length, pending: pending.length, retry: retry.length, ready,
                      batchMs, batchMax, epochBatches, ...m, perBatchMs: m.batches ? Number((m.sealMs / m.batches).toFixed(3)) : 0,
                      state: st.stat ? st.stat() : { seq: st.seq } }),      // the rig's adapter has no books of its own to report
-    async stop() { stopped = true; if (timer) { clearTimeout(timer); timer = null; } try { await chain; await settled(); } catch {} },
+    async stop() { stopped = true; if (timer) { clearTimeout(timer); timer = null; } try { await chain; await settled(); } catch {} if (ownState) { try { st.close?.(); } catch {} } },
   };
 }
 
@@ -296,8 +298,30 @@ export function createSequencerRig({
     // the state the batch commits to is the ENGINE's books, not a shadow of them: the engine did the matching,
     // and a commitment to anything else would be a commitment to a book nobody traded on. `ops` is the shard's
     // op counter, defined exactly as createShardState defines it, so every miner's counter agrees.
+    //
+    // The commitment is commit-state.js's, in the mode L3_COMMIT names, and in tree mode it is fed by the SAME
+    // events a miner's createShardState feeds its tree with — the engine's add result and its cancel — so the
+    // sequencer's root is the root a miner replaying the log arrives at. A book joining the shard seeds the tree
+    // with its resting orders as they are at that moment (after a restart the engine's replay rebuilt them before
+    // anything was sequenced); from then on every mutation of the engine's book is mirrored, sequenced or not.
     const books = new Set();
-    const state = { ops: 0, get seq() { return this.ops; }, bookHash: () => bookHashOf([...books].flatMap((b) => b.m.orders())) };
+    const cs = createCommitState({ env, resting: () => [...books].flatMap((b) => b.m.orders()), logger: logFn });
+    const state = {
+      ops: 0, get seq() { return this.ops; }, bookHash: () => cs.root(), commit: cs,
+      /// true when the book was new to the shard (its resting orders were just seeded, this op included)
+      track(book) { if (books.has(book)) return false; books.add(book); cs.seed(book.m.orders()); return true; },
+      /// one order the engine matched: `result` is the book's add result; without it the taker is looked up
+      applied(book, rec, fills, result) {
+        if (state.track(book)) return;
+        const o = rec.o, user = lower(o.user), me = { hash: rec.hash, user, buy: o.buy, price: o.price };
+        if (result) return cs.applied({ fills, rested: result.rested, remaining: result.remaining, seq: result.seq }, me);
+        for (const f of fills) cs.filled(f);
+        const live = book.m.get(rec.hash); if (live) cs.rested({ ...me, remaining: live.remaining, seq: live.seq });
+      },
+      /// one cancel: `o` is what the book's cancel() returned (null: it hit nothing); unknown → let the tree say
+      cancelled(book, rec, o) { if (state.track(book)) return; if (o !== null) cs.cancelled(rec.hash); },
+      close() { cs.close(); },
+    };
     const seq = createSequencer({
       shard, state,
       log: { kind: 'deferred', append: async (t, v) => (await ready()).append(t, v), appendMany: async (t, vs) => (await ready()).appendMany(t, vs), offset: async (t) => (await ready()).offset(t), read: async (t, f, l) => (await ready()).read(t, f, l) },
@@ -329,26 +353,29 @@ export function createSequencerRig({
     async prepare(book) {
       if (stopping) return null;
       const s = shardFor(shardOf(book.market, book.outcome));
-      s.books.add(book);
+      s.state.track(book);
       try { await s.ready; } catch {}
       return s.seq.ready ? s.shard : null;
     },
-    /// the engine's hooks: one matched order, or one cancel, goes into the log. `rec` is book.js's order record
-    /// and `fills` are the fills the engine's own book produced. Returns the slot the fills belong to, or null
-    /// when the log is not up yet (the caller then settles them as it does today).
-    record(book, rec, fills = []) {
+    /// the engine's hooks: one matched order, or one cancel, goes into the log. `rec` is book.js's order record,
+    /// `fills` are the fills the engine's own book produced and `result` its add result (what rested, and under
+    /// which sequence number — the commitment needs it; without it the book is asked). Returns the slot the fills
+    /// belong to, or null when the log is not up yet (the caller then settles them as it does today).
+    record(book, rec, fills = [], result = undefined) {
       if (stopping) return null;
       const s = shardFor(shardOf(book.market, book.outcome));
+      s.state.applied(book, rec, fills, result);                 // the commitment mirrors the engine's book, sequenced or not
       if (!s.seq.ready) { stats.skipped++; return null; }         // before the log is up: settle as today
-      s.books.add(book); s.state.ops++;
+      s.state.ops++;
       stats.records++;
       return s.seq.record({ t: 'add', hash: rec.hash, market: book.market, outcome: book.outcome, order: serializeL3Order(rec.o), sig: rec.sig, signer: lower(rec.signer || rec.o.user), at: rec.at || Date.now() }, fills);
     },
-    recordCancel(book, rec, by = 'user') {
+    recordCancel(book, rec, by = 'user', cancelled = undefined) {
       if (stopping) return null;
       const s = shardFor(shardOf(book.market, book.outcome));
+      s.state.cancelled(book, rec, cancelled);
       if (!s.seq.ready) { stats.skipped++; return null; }
-      s.books.add(book); s.state.ops++;
+      s.state.ops++;
       stats.records++;
       return s.seq.record({ t: 'cancel', hash: rec.hash, market: book.market, outcome: book.outcome, user: lower(rec.o.user), by, at: Date.now() }, []);
     },
@@ -362,7 +389,7 @@ export function createSequencerRig({
     },
     async stop() {
       stopping = true;
-      for (const s of shards.values()) { try { await s.seq.stop(); } catch {} try { s.sub && (await s.sub.close()); } catch {} }
+      for (const s of shards.values()) { try { await s.seq.stop(); } catch {} try { s.sub && (await s.sub.close()); } catch {} try { s.state.close(); } catch {} }
       shards.clear();
       if (logImpl) { try { await logImpl.close(); } catch {} }
     },

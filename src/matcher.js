@@ -4,8 +4,14 @@
 // what lets the journal be replayed on boot and lets a validator re-run a shard's day and compare. Prices and
 // sizes are bigints (1e18-scaled collateral per share, 1e18 outcome-token units), exactly what RollaBook settles.
 //
-//   add(order)     → { fills, rested, remaining, reason }   a taker crosses the far side FIFO at the MAKER's price;
-//                                                            what is left rests (unless ioc); post-only never crosses
+//   add(order)     → { fills, rested, remaining, reason, seq }   a taker crosses the far side FIFO at the MAKER's price;
+//                                                            what is left rests (unless ioc); post-only never crosses.
+//                                                            `seq` is the order's own sequence number (0 if it was
+//                                                            never numbered: duplicate, bad order); every fill
+//                                                            carries `makerRemaining`, what is left of the maker
+//                                                            after it (0n → the maker left the book). Both feed the
+//                                                            incremental state commitment (miner/commit-state.js)
+//                                                            and change nothing about matching.
 //   cancel(hash)   → the resting order, or null
 //   depth(n)       → the top n levels per side
 //
@@ -45,12 +51,12 @@ export function createBook() {
 
   /// o: { hash, user, buy, price (bigint), size (bigint), remaining? (bigint), postOnly?, ioc?, ts? }
   function add(o) {
-    if (byHash.has(o.hash)) return { fills: [], rested: false, remaining: byHash.get(o.hash).remaining, reason: 'duplicate' };
-    if (!(o.price > 0n) || !(o.size > 0n)) return { fills: [], rested: false, remaining: 0n, reason: 'bad order' };
+    if (byHash.has(o.hash)) return { fills: [], rested: false, remaining: byHash.get(o.hash).remaining, reason: 'duplicate', seq: 0 };
+    if (!(o.price > 0n) || !(o.size > 0n)) return { fills: [], rested: false, remaining: 0n, reason: 'bad order', seq: 0 };
     const order = { hash: o.hash, user: o.user, buy: !!o.buy, price: o.price, size: o.size, remaining: o.remaining ?? o.size, postOnly: !!o.postOnly, ioc: !!o.ioc, ts: o.ts || 0, seq: ++seq, prev: null, next: null, level: null };
     const far = order.buy ? asks : bids, farPrices = order.buy ? askPrices : bidPrices;
     const crosses = (p) => (order.buy ? p <= order.price : p >= order.price);
-    if (order.postOnly && farPrices.length && crosses(farPrices[0])) return { fills: [], rested: false, remaining: order.remaining, reason: 'would cross' };
+    if (order.postOnly && farPrices.length && crosses(farPrices[0])) return { fills: [], rested: false, remaining: order.remaining, reason: 'would cross', seq: order.seq };
     const fills = [];
     while (farPrices.length && order.remaining > 0n && crosses(farPrices[0])) {
       const lvl = far.get(farPrices[0]);
@@ -58,14 +64,14 @@ export function createBook() {
       while (r && order.remaining > 0n) {
         const size = r.remaining < order.remaining ? r.remaining : order.remaining;
         r.remaining -= size; order.remaining -= size; lvl.total -= size;
-        fills.push({ seq: ++seq, makerHash: r.hash, takerHash: order.hash, maker: r.user, taker: order.user, price: r.price, size, takerBuys: order.buy });
+        fills.push({ seq: ++seq, makerHash: r.hash, takerHash: order.hash, maker: r.user, taker: order.user, price: r.price, size, takerBuys: order.buy, makerRemaining: r.remaining });
         if (r.remaining === 0n) { const nx = r.next; unlink(lvl, r); byHash.delete(r.hash); r = nx; }
       }
       if (!dropIfEmpty(lvl, !order.buy)) break;   // the level still has size: the taker is done
     }
     let rested = false;
     if (order.remaining > 0n && !order.ioc) { rest(order); rested = true; }
-    return { fills, rested, remaining: order.remaining, reason: null };
+    return { fills, rested, remaining: order.remaining, reason: null, seq: order.seq };
   }
 
   function cancel(hash) {

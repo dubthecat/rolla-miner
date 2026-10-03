@@ -37,8 +37,9 @@ bench: bench.cpp $(SRC) $(HDR)
 bench3: bench.cpp $(SRC) $(HDR)
 	$(CXX) $(STD) $(OPT3) $(WARN) bench.cpp $(SRC) -o $@ $(LDLIBS)
 
-bookd: bookd.cpp $(SRC) $(HDR)
-	$(CXX) $(STD) $(OPT2) $(WARN) bookd.cpp $(SRC) -o $@ $(LDLIBS)
+# bookd serves the commit tree too (OP_COMMIT / OP_CPROOF): the shard's incremental state commitment behind the same framing
+bookd: bookd.cpp $(SRC) $(CSRC) $(HDR) $(CHDR)
+	$(CXX) $(STD) $(OPT2) $(WARN) bookd.cpp $(SRC) $(CSRC) -o $@ $(LDLIBS)
 
 # the incremental state commitment (commit.hpp): the Merkle-treap over the resting book, and its keccak
 commit_test: commit_test.cpp $(CSRC) $(CHDR)

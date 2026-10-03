@@ -77,7 +77,10 @@ function higher(a, b) {
   if (a.pLo !== b.pLo) return a.pLo > b.pLo;
   return cmpKey(a, b) < 0;
 }
-const nodeHash = (leaf, l, r) => tagged(TREAP, leaf, l ? l.nh : Z32, r ? r.nh : Z32);
+// one preallocated 97-byte preimage (0x03 ‖ leaf ‖ left ‖ right), like merkle.js's pair buffer: a fresh array per
+// node hash was a fifth of an insert's time, and keccak256 copies its input before returning a new digest
+const NODE_BUF = new Uint8Array(97); NODE_BUF[0] = TREAP;
+const nodeHash = (leaf, l, r) => { NODE_BUF.set(leaf, 1); NODE_BUF.set(l ? l.nh : Z32, 33); NODE_BUF.set(r ? r.nh : Z32, 65); return keccak256(NODE_BUF); };
 
 export function createCommitTree() {
   const byHash = new Map();      // hash → node

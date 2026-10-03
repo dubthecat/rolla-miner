@@ -30,11 +30,12 @@ import http from 'node:http';
 import path from 'node:path';
 import { createBook } from '../matcher.js';
 import { parseL3Order, BOOK_DOMAIN } from '../desk.js';
-import { fillsRootOf, ordersRootOf, bookHashOf, batchRootOf, voteDigestOf, merkleProof, fillLeaf, ZERO32 } from './merkle.js';
+import { fillsRootOf, ordersRootOf, batchRootOf, voteDigestOf, merkleProof, fillLeaf, ZERO32 } from './merkle.js';
 import { createVerifier, recoverDigestSigner, signDigest } from './verify.js';
 import { createQuorum } from './quorum.js';
 import { rewardsFromEnv } from './rewards.js';
 import { ordersTopic, votesTopic } from './log.js';
+import { createCommitState } from './commit-state.js';
 
 const lower = (a) => String(a || '').toLowerCase();
 
@@ -46,10 +47,17 @@ const lower = (a) => String(a || '').toLowerCase();
 /// `seq` is the shard's op counter, not a book's matcher sequence: each book numbers its own sequence, so the
 /// shard needs a counter of its own for the batch's seqFrom/seqTo. It counts applied ops, nothing else, so it is
 /// identical on every replica.
-export function createShardState({ newBook = null, logger = null } = {}) {
+///
+/// The epoch book commitment (`bookHash()`) is commit-state.js's: `L3_COMMIT=bookhash` (default) rebuilds a root
+/// over every resting order, `L3_COMMIT=tree` keeps the incremental Merkle-treap fed from the book's own events
+/// — an order that rests, a maker partially filled or filled out, a cancel that hits — right here in apply(), so
+/// the boundary is a read. `commit` is a mode string or createCommitState's options; unset, the environment decides.
+export function createShardState({ newBook = null, logger = null, commit = null, env = process.env } = {}) {
   const make = newBook || (() => createBook());
   const books = new Map();     // `${market}:${outcome}` → book
   let seq = 0, applied = 0, fills = 0, cancels = 0, rejects = 0;
+  const resting = () => { const out = []; for (const b of books.values()) for (const o of b.orders()) out.push(o); return out; };
+  const cs = createCommitState({ ...(typeof commit === 'string' ? { mode: commit } : (commit || {})), resting, env, logger });
   const keyOf = (market, outcome) => `${Number(market)}:${Number(outcome)}`;
   function bookFor(market, outcome) {
     const key = keyOf(market, outcome); let b = books.get(key);
@@ -62,24 +70,27 @@ export function createShardState({ newBook = null, logger = null } = {}) {
     if (op.t === 'cancel') {
       const b = books.get(keyOf(op.market, op.outcome));
       const o = b ? b.cancel(op.hash) : null;
-      if (o) cancels++; else rejects++;
+      if (o) { cancels++; cs.cancelled(o.hash); } else rejects++;
       return { fills: [], cancelled: !!o, remaining: o ? o.remaining : 0n, reason: o ? null : 'unknown order' };
     }
     const o = parseL3Order(op.order);
     const b = bookFor(o.marketId, o.outcome);
-    const r = b.add({ hash: op.hash, user: lower(o.user), buy: o.buy, price: o.price, size: o.size, postOnly: o.postOnly, ioc: o.ioc, ts: op.at || 0 });
+    const user = lower(o.user);
+    const r = b.add({ hash: op.hash, user, buy: o.buy, price: o.price, size: o.size, postOnly: o.postOnly, ioc: o.ioc, ts: op.at || 0 });
     fills += r.fills.length; if (r.reason) rejects++;
+    cs.applied(r, { hash: op.hash, user, buy: o.buy, price: o.price });   // the makers it hit, and itself if it rests
     return r;
   }
-  /// every resting order in the shard, for the epoch-boundary book commitment
-  function resting() { const out = []; for (const b of books.values()) for (const o of b.orders()) out.push(o); return out; }
   return {
-    apply, bookFor, books, resting,
-    bookHash: () => bookHashOf(resting()),
+    apply, bookFor, books, resting, commit: cs,
+    /// the epoch-boundary book commitment: bookHashOf(resting()) or the tree's root, by L3_COMMIT
+    bookHash: () => cs.root(),
+    /// push the buffered commitment updates to the tree (a batch boundary; a no-op for bookhash)
+    flush: () => cs.flush(),
     get seq() { return seq; },
     get size() { let n = 0; for (const b of books.values()) n += b.size; return n; },
-    stat: () => ({ seq, applied, fills, cancels, rejects, books: books.size, resting: (() => { let n = 0; for (const b of books.values()) n += b.size; return n; })() }),
-    close() { for (const b of books.values()) { try { b.close?.(); } catch (e) { logger && logger(`[l3miner] book close failed: ${e.message}`); } } books.clear(); },
+    stat: () => ({ seq, applied, fills, cancels, rejects, books: books.size, resting: (() => { let n = 0; for (const b of books.values()) n += b.size; return n; })(), commit: cs.stats() }),
+    close() { for (const b of books.values()) { try { b.close?.(); } catch (e) { logger && logger(`[l3miner] book close failed: ${e.message}`); } } books.clear(); cs.close(); },
   };
 }
 
@@ -111,11 +122,12 @@ export async function bookFactory({ env = process.env, dir = null, logger = null
  *               other than the user is accepted on the sequencer's word and counted in `unchecked`
  *   watchVotes  also track every miner's votes (its own included), so the miner knows what is final — and what
  *               it has earned in µROLLA (rewards.js) — without asking the engine or the operator
+ *   commit      the epoch book commitment: 'bookhash' | 'tree' or createCommitState's options (default L3_COMMIT)
  *   tamper      TEST HOOK: (batch, fills) => fills — a Byzantine miner. Never set in production.
  */
 export function createMiner({
   shard, log, account, domain = null, dir = null, newBook = null, verifier = null, workers = null,
-  sequencers = null, grantOf = null, watchVotes = true, threshold = 2, staleMs = 30000,
+  sequencers = null, grantOf = null, watchVotes = true, threshold = 2, staleMs = 30000, commit = null,
   tamper = null, onBatch = null, onVote = null, logger: logFn = console.log, env = process.env,
 } = {}) {
   if (!shard) throw new Error('a miner needs a shard');
@@ -125,7 +137,8 @@ export function createMiner({
   const dom = domain || BOOK_DOMAIN(Number(env.CHAIN_ID || 46630), env.PREDICT_BOOK || '0x' + '00'.repeat(20));
   const allowSeq = sequencers ? new Set([...sequencers].map(lower)) : null;
   let make = newBook || (() => createBook());          // replaced by the native factory in start() when asked
-  let state = createShardState({ newBook: make, logger: logFn });
+  const newState = () => createShardState({ newBook: make, logger: logFn, commit, env });
+  let state = newState();
   const v = verifier || createVerifier({ domain: dom, workers: workers == null ? (env.L3_VERIFY_WORKERS != null ? Number(env.L3_VERIFY_WORKERS) : null) : workers, logger: logFn });
   const ownVerifier = !verifier;
   const orders = ordersTopic(shard), votes = votesTopic(shard);
@@ -136,7 +149,7 @@ export function createMiner({
   if (dir) { fs.mkdirSync(dir, { recursive: true }); jBatches = path.join(dir, `${shard}.batches.jsonl`); jVotes = path.join(dir, `${shard}.votes.jsonl`); }
   const append = (file, rec) => { if (file) try { fs.appendFileSync(file, JSON.stringify(rec) + '\n'); } catch (e) { logFn(`[l3miner] journal append failed: ${e.message}`); } };
 
-  const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0, voteFailures: 0, voteRetried: 0 };
+  const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, commitMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0, voteFailures: 0, voteRetried: 0 };
   let index = -1, epoch = 0, prevRoot = ZERO32, offset = -1, stalled = null, subOrders = null, subVotes = null, started = false, stopping = false;
   let lastVote = null, lastBookHash = ZERO32, inflight = Promise.resolve();
   const recent = new Map();                            // index → { batch, fills }, for challenge proofs
@@ -190,6 +203,8 @@ export function createMiner({
       let fills = [];
       for (const op of ops) { const r = state.apply(op); if (r.fills?.length) fills.push(...r.fills); }
       m.applyMs += Number(process.hrtime.bigint() - t1) / 1e6; m.fills += fills.length;
+      // the batch's commitment updates go to the tree now, spread over the epoch, so the boundary below is a read
+      const t1c = process.hrtime.bigint(); state.flush(); m.commitMs += Number(process.hrtime.bigint() - t1c) / 1e6;
       if (tamper) fills = tamper(batch, fills);                               // TEST HOOK: a Byzantine miner
 
       const t2 = process.hrtime.bigint();
@@ -290,6 +305,7 @@ export function createMiner({
       const ops = Array.isArray(batch.ops) ? batch.ops : [];
       let fills = [];
       for (const op of ops) { const r = state.apply(op); if (r.fills?.length) fills.push(...r.fills); }
+      state.flush();
       const bookHash = (batch.bookHash && batch.bookHash !== ZERO32) ? state.bookHash() : ZERO32;
       const myRoot = batchRootOf({ shard: String(shard), epoch: Number(batch.epoch), index: Number(batch.index), seqFrom: Number(batch.seqFrom), seqTo: Number(batch.seqTo), prevRoot: batch.prevRoot || ZERO32, ordersRoot: ordersRootOf(ops), fillsRoot: fillsRootOf(fills), bookHash });
       if (myRoot !== batch.batchRoot) return { ok: false, why: `journal batch ${batch.index} no longer reproduces its root`, replayed: n };
@@ -305,19 +321,19 @@ export function createMiner({
     if (started) return api; started = true;
     if (!newBook && env.L3_NATIVE === '1') {            // the native backend, resolved before anything is applied
       make = await bookFactory({ env, dir, logger: logFn });
-      state.close(); state = createShardState({ newBook: make, logger: logFn });
+      state.close(); state = newState();
     }
     const r = replayJournal();
     if (!r.ok) {
       logFn(`[l3miner] ${r.why} — discarding the local journal and replaying ${shard} from the log`);
       try { fs.renameSync(jBatches, `${jBatches}.corrupt.${Date.now()}`); } catch {}
       state.close(); index = -1; epoch = 0; prevRoot = ZERO32; offset = -1; lastBookHash = ZERO32;
-      state = createShardState({ newBook: make, logger: logFn });
+      state = newState();
     } else if (r.replayed) {
       logFn(`[l3miner] ${shard}: replayed ${r.replayed} batch(es) from the journal → index ${index}, ${state.size} resting, book ${lastBookHash.slice(0, 12)}…`);
     }
     const from = offset + 1;
-    logFn(`[l3miner] up · shard ${shard} · miner ${account.address} · log ${log.kind} · ${v.workers} verify worker(s) · from offset ${from}`);
+    logFn(`[l3miner] up · shard ${shard} · miner ${account.address} · log ${log.kind} · ${v.workers} verify worker(s) · commitment ${state.commit.mode}${state.commit.tree ? ' (' + state.commit.impl + ')' : ''} · from offset ${from}`);
     subOrders = await log.subscribe(orders, from, serial(handleBatch));
     // its OWN votes go in too: the agreeing set is what earns, so a miner that skipped itself could not account
     // for its own µROLLA (rewards.js), and the quorum keys votes by miner so re-reading one is harmless
@@ -393,6 +409,10 @@ export function createMiner({
         g('verify_ms_total', Math.round(m.verifyMs), 'wall milliseconds spent verifying signatures');
         g('root_ms_total', Math.round(m.rootMs), 'wall milliseconds spent on Merkle roots and book commitments');
         g('apply_ms_total', Math.round(m.applyMs), 'wall milliseconds spent replaying ops into the book');
+        g('commit_ms_total', Math.round(m.commitMs), 'wall milliseconds spent feeding the incremental state commitment (L3_COMMIT=tree)');
+        g('commit_updates_total', s.state.commit?.ops || 0, 'commitment updates (rests, fills, cancels) fed to the tree');
+        g('commit_refused_total', s.state.commit?.refused || 0, 'commitment updates the tree refused (the book and the commitment disagree)');
+        g('commit_tree', s.state.commit?.mode === 'tree' ? (s.state.commit.impl === 'native' ? 2 : 1) : 0, '0 bookhash, 1 the in-process tree, 2 the native tree');
         g('votes_pending', votesPending.length + votesRetry.length, 'votes not yet in the log');
         g('verify_workers', v.workers, 'signature verification worker threads');
         g('stalled', stalled ? 1 : 0, '1 when the miner stopped applying batches');
