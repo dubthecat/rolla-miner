@@ -1,0 +1,9 @@
+# a local cluster: one Redpanda broker (Kafka API on 9092) and three miners on the same log
+services:
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command: redpanda start --overprovisioned --smp 1 --memory 512M --reserve-memory 0M --node-id 0 --check=false --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports: ["9092:9092"]
+  miner1: { build: ., environment: { L3_LOG: kafka, L3_KAFKA_BROKERS: "redpanda:9092", L3_SHARD: "1", L3_MINER_KEY: "${MINER1_KEY}" }, ports: ["8081:8080"], depends_on: [redpanda] }
+  miner2: { build: ., environment: { L3_LOG: kafka, L3_KAFKA_BROKERS: "redpanda:9092", L3_SHARD: "1", L3_MINER_KEY: "${MINER2_KEY}" }, ports: ["8082:8080"], depends_on: [redpanda] }
+  miner3: { build: ., environment: { L3_LOG: kafka, L3_KAFKA_BROKERS: "redpanda:9092", L3_SHARD: "1", L3_MINER_KEY: "${MINER3_KEY}" }, ports: ["8083:8080"], depends_on: [redpanda] }

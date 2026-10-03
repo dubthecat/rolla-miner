@@ -1,0 +1,19 @@
+{
+  "name": "rolla-miner",
+  "version": "0.1.0",
+  "description": "RollMarkets L3 miner: replays the sequenced order log into a deterministic price-time book (native C++ core or the JavaScript reference), hashes the result and votes; validators attest finalized roots, the chain settles.",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:dubthecat/rolla-miner",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/run.mjs",
+    "test": "node --test src/ && make -C native/book test",
+    "native": "make -C native/book",
+    "sync": "bash scripts/sync-from-proto.sh"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "viem": "^2.21.0"
+  }
+}

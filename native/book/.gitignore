@@ -1,0 +1,13 @@
+# built binaries and journals (make all)
+book_test
+trace
+trace3
+bench
+bench3
+bookd
+libbook.so
+book_test_asan
+trace_asan
+*.o
+*.journal
+.journal-test/

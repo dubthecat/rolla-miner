@@ -1,0 +1,12 @@
+node_modules/
+native/book/book_test
+native/book/book_test_asan
+native/book/trace
+native/book/trace3
+native/book/trace_asan
+native/book/bench
+native/book/bench3
+native/book/bookd
+native/book/libbook.so
+data/
+*.log
