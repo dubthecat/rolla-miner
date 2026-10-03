@@ -43,10 +43,7 @@ import { createRequire } from 'node:module';
 
 export const ZERO32 = '0x' + '00'.repeat(32);
 const LEAF = 0x00, NODE = 0x01, ROOT = 0x02;
-// 0x03 is the node of the incremental state commitment (commit.js, native/book/commit.hpp): a Merkle-treap
-// node is keccak256(0x03 ‖ leaf ‖ left ‖ right), which no leaf, pair or apex of this tree can collide with.
-const TREAP = 0x03;
-export const TAG = { LEAF, NODE, ROOT, TREAP };
+export const TAG = { LEAF, NODE, ROOT };
 
 // Hex conversion is on the hot path twice per field of every leaf, so both directions are table-driven: a
 // 256-entry byte→"xx" table, and a 128-entry char→nibble table that validates while it parses. The obvious
@@ -146,13 +143,12 @@ export function orderLeaf(op) {
 }
 /// the leaf of one RESTING order, for the book-state commitment. Price-time identity only: who, which side,
 /// what price, how much is left, and the sequence number that fixes its place in the FIFO.
-export function restingLeafBytes(o) {
+export function restingLeaf(o) {
   const w = new Words(6)
     .bytes32(o.hash).address(o.user).bool(o.buy)
     .uint(o.price).uint(o.remaining).uint(o.seq);
-  return tagged(LEAF, w.done());
+  return hex(tagged(LEAF, w.done()));
 }
-export const restingLeaf = (o) => hex(restingLeafBytes(o));
 
 // ------------------------------------------------------------------ tree
 const u32 = (n) => { const b = new Uint8Array(4); b[0] = (n >>> 24) & 255; b[1] = (n >>> 16) & 255; b[2] = (n >>> 8) & 255; b[3] = n & 255; return b; };
