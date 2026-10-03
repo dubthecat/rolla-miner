@@ -5,6 +5,16 @@
 //   RUNPOD_API_KEY=… node scripts/runpod-cluster.mjs [--miners 3] [--orders 4000] [--vcpu 2] [--flavor cpu3c] [--chaos] [--keep]
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { createPod, waitRunning, endpoint, terminatePod, getJson, podInfo } from './runpod.mjs';
+const FLAVORS = ['cpu3c', 'cpu5c', 'cpu3g', 'cpu5g', 'cpu3m', 'cpu5m'];
+/// RunPod says 500 "Something went wrong" when a flavor has no instance with that many vCPUs: walk the flavors, then halve the vCPUs
+async function createPodOnLadder(opts, say) {
+  let lastErr = null;
+  for (const vcpu of [opts.vcpu, Math.max(2, Math.floor(opts.vcpu / 2))]) for (const flavor of [opts.flavor, ...FLAVORS.filter((f) => f !== opts.flavor)]) {
+    try { const p = await createPod({ ...opts, vcpu, flavor }); return { ...p, vcpu, flavor }; }
+    catch (e) { lastErr = e; say(`no pod on ${flavor} × ${vcpu} vCPU: ${e.message.slice(0, 90)}`); }
+  }
+  throw lastErr;
+}
 import { createKafkaLog, ordersTopic, votesTopic } from '../src/miner/log.js';
 import { createSequencer } from '../src/miner/sequencer.js';
 import { createShardState } from '../src/miner/miner.js';
@@ -54,9 +64,9 @@ try {
   const minerAddrs = minerKeys.map((k) => privateKeyToAccount(k).address);
   const miners = [];
   for (let i = 0; i < N_MINERS; i++) {
-    const p = await createPod({ name: `miner-${SHARD}-${i + 1}`, image: IMAGE, ports: ['8080/http'], vcpu: VCPU, flavor: FLAVOR, diskGb: 10,
-      env: { L3_LOG: 'kafka', L3_KAFKA_BROKERS: brokers, L3_SHARD: SHARD, L3_MINER_KEY: minerKeys[i], PREDICT_BOOK: BOOK, CHAIN_ID: String(CHAIN_ID), L3_SEQUENCERS: seqAcct.address, L3_THRESHOLD: String(THRESHOLD), L3_VERIFY_WORKERS: String(Math.max(1, VCPU - 1)), PORT: '8080', DATA_DIR: '/data' } });
-    pods.push(p); miners.push({ ...p, address: minerAddrs[i] }); say('miner pod', i + 1, p.id, minerAddrs[i], `$${p.costPerHr}/h`);
+    const p = await createPodOnLadder({ name: `miner-${SHARD}-${i + 1}`, image: IMAGE, ports: ['8080/http'], vcpu: VCPU, flavor: FLAVOR, diskGb: 10,
+      env: { L3_LOG: 'kafka', L3_KAFKA_BROKERS: brokers, L3_SHARD: SHARD, L3_MINER_KEY: minerKeys[i], PREDICT_BOOK: BOOK, CHAIN_ID: String(CHAIN_ID), L3_SEQUENCERS: seqAcct.address, L3_THRESHOLD: String(THRESHOLD), L3_VERIFY_WORKERS: String(Math.max(1, VCPU - 1)),   /* re-set below from the vCPUs actually granted */ PORT: '8080', DATA_DIR: '/data' } });
+    pods.push(p); miners.push({ ...p, address: minerAddrs[i] }); say('miner pod', i + 1, p.id, minerAddrs[i], `${p.flavor} × ${p.vcpu} vCPU`, `$${p.costPerHr}/h`);
   }
   for (const m of miners) { const info = await waitRunning(m.id, { timeoutMs: 420000 }); m.url = endpoint(info, 8080); }
   for (const m of miners) { let ok = false; for (let i = 0; i < 60 && !ok; i++) { try { const h = await getJson(m.url + '/healthz'); ok = h && (h.ok === true || h.status === 'ok' || h.index != null); if (!ok && i % 6 === 0) say(m.name, 'health:', JSON.stringify(h).slice(0, 100)); } catch {} if (!ok) await sleep(5000); } say(m.name, ok ? 'healthy' : 'NOT healthy after 5 min', m.url); }
@@ -85,7 +95,7 @@ try {
       order.nonce = BigInt(1700000000000 + offset + i); order.salt = BigInt(offset + i) * 7919n + 1n;
       plan.push({ t: 'add', acct, order }); if (!order.ioc) live.push(plan.length - 1);
     }
-    for (const p of plan) if (p.t === 'add') { const order = serializeL3Order(p.order); const sig = await p.acct.signTypedData({ domain, types: L3_ORDER_TYPES, primaryType: 'L3Order', message: p.order }); p.op = { t: 'add', hash: orderHash(domain, order), market: MARKET, outcome: OUTCOME, order, sig, signer: p.acct.address.toLowerCase(), at: 1700000000000 }; }
+    for (const p of plan) if (p.t === 'add') { const order = serializeL3Order(p.order); const sig = await p.acct.signTypedData({ domain, types: L3_ORDER_TYPES, primaryType: 'L3Order', message: p.order }); p.op = { t: 'add', hash: orderHash(domain, order), market: MARKET, outcome: OUTCOME, order, sig, signer: p.acct.address.toLowerCase(), at: Date.now() }; }
     for (const p of plan) if (p.t === 'cancel') p.op = { t: 'cancel', hash: plan[p.target].op.hash, market: MARKET, outcome: OUTCOME };
     return plan.map((p) => p.op);
   }
@@ -119,4 +129,4 @@ try {
   await seq.stop(); try { await log.close?.(); } catch {}
   say(`RESULT finalized ${quorum.finalIndex + 1} batches of ${sealed.length} sealed · ${finals.length} finals · ${forks.length} forks`);
 } catch (e) { say('FAILED:', e.message); process.exitCode = 1; }
-finally { await teardown(); }
+finally { await teardown(); process.exit(process.exitCode || 0); }
