@@ -56,6 +56,7 @@ const lower = (a) => String(a || '').toLowerCase();
 export function createSequencer({
   shard, log, account, state = null, batchMs = 60, batchMax = 500, epochBatches = 20,
   sealEmpty = false, onSealed = null, onEpoch = null, rewardsRoot = null, logger: logFn = console.log, newBook = null,
+  appendBytes = 6 << 20,   // one append request carries as many sealed batches as fit under this (the broker's limit is 8 MiB on rolla-l3-broker)
 } = {}) {
   if (!shard) throw new Error('a sequencer needs a shard');
   if (!log) throw new Error('a sequencer needs a log');
@@ -69,6 +70,8 @@ export function createSequencer({
   const queued = [];   // full batches (batchMax ops) waiting for their seal, in order — a seal in flight must not let the next batch grow past batchMax
   let timer = null, chain = Promise.resolve(), stopped = false, ready = false;
   const retry = [];
+  const pending = [];   // sealed, signed batches waiting for the log, in order — the seal never waits for the append (see pump)
+  let pumping = null;
 
   const slotOf = (i) => `${shard}#${i}`;
   /// where an op recorded right now will land. Known before the batch is sealed, which is what lets the engine
@@ -139,26 +142,58 @@ export function createSequencer({
     prevRoot = batch.batchRoot; index++; seqFrom = take.seqTo + 1;
     if (atEpochEnd) epoch++;
     batch.sig = await signDigest(account, batch.batchRoot);
-    try {
-      await log.append(topic, batch);
-      m.sealed++;
-    } catch (e) {
-      // the log refused the batch. The chain is already advanced, so the batch is kept and retried: a batch
-      // that never reaches the log can never finalize, and its fills therefore never settle — which is the
-      // correct failure (docs/L3-MINERS.md §7, "Kafka partition").
-      retry.push(batch); m.failed++;
-      logFn(`[l3seq] ${shard}#${thisIndex} could not be logged (${e.message}); ${retry.length} batch(es) waiting`);
-    }
+    // the seal is done: the batch joins the append pipeline and the NEXT seal starts now, while this one is in
+    // flight. The log's order is the pipeline's order, and onSealed/onEpoch fire once the log has answered.
+    pending.push({ batch, fills, bytes: Buffer.byteLength(JSON.stringify(batch)), thisIndex, thisEpoch, atEpochEnd, bookHash, fillsTotal: m.fills });
     m.batches++; m.lastSealAt = Date.now(); m.sealMs += Number(process.hrtime.bigint() - t0) / 1e6;
-    try { onSealed && onSealed(batch, fills); } catch (e) { logFn(`[l3seq] onSealed failed: ${e.message}`); }
-    if (atEpochEnd && onEpoch) {
-      const e = { shard: String(shard), epoch: thisEpoch, index: thisIndex, batchRoot: batch.batchRoot, bookHash, fills: m.fills, rewardsRoot: batch.rewardsRoot, rewardsEpoch: batch.rewardsEpoch };
-      try { onEpoch({ ...e, digest: epochDigestOf(e) }, batch); } catch (err) { logFn(`[l3seq] onEpoch failed: ${err.message}`); }
-    }
-    if (retry.length) drain();
+    pump();
     if (queued.length) sealSoon(); else if (open.ops.length) arm();
     return batch;
   }
+  /// the append pipeline. Seals never wait for the log: pending batches go out in order, as many per request as
+  /// fit under appendBytes (one produce = one round trip whatever it carries, and a single-partition record batch
+  /// is accepted or refused whole), and a seal in progress overlaps the request in flight. From outside the
+  /// broker's region the round trip (260–300 ms to Amsterdam) WAS the sequencing budget (L3-MINERS.md §6).
+  function pump() {
+    if (!pumping) pumping = (async () => { try { await pumpLoop(); } catch (e) { logFn(`[l3seq] append pipeline: ${e.message}`); } finally { pumping = null; if (pending.length) pump(); } })();
+    return pumping;
+  }
+  async function pumpLoop() {
+    while (pending.length) {
+      if (retry.length) await drain();
+      const group = [pending[0]]; let bytes = pending[0].bytes;
+      while (pending.length > group.length && bytes + pending[group.length].bytes <= appendBytes) { bytes += pending[group.length].bytes; group.push(pending[group.length]); }
+      pending.splice(0, group.length);
+      if (retry.length) {
+        // the log is still refusing: these wait behind the batches already waiting, in order
+        for (const p of group) refused(p.batch, 'the log is refusing earlier batches');
+      } else if (group.length > 1 && typeof log.appendMany === 'function') {
+        try { await log.appendMany(topic, group.map((p) => p.batch)); m.sealed += group.length; }
+        catch (e) { for (const p of group) refused(p.batch, e.message); }
+      } else {
+        for (let i = 0; i < group.length; i++) {
+          try { await log.append(topic, group[i].batch); m.sealed++; }
+          catch (e) { for (let j = i; j < group.length; j++) refused(group[j].batch, e.message); break; }
+        }
+      }
+      for (const p of group) finish(p);
+    }
+  }
+  /// the log refused a batch. The chain is already advanced, so the batch is kept and retried: a batch that
+  /// never reaches the log can never finalize, and its fills therefore never settle — which is the correct
+  /// failure (docs/L3-MINERS.md §7, "Kafka partition").
+  function refused(batch, why) {
+    retry.push(batch); m.failed++;
+    logFn(`[l3seq] ${shard}#${batch.index} could not be logged (${why}); ${retry.length} batch(es) waiting`);
+  }
+  function finish(p) {
+    try { onSealed && onSealed(p.batch, p.fills); } catch (e) { logFn(`[l3seq] onSealed failed: ${e.message}`); }
+    if (p.atEpochEnd && onEpoch) {
+      const e = { shard: String(shard), epoch: p.thisEpoch, index: p.thisIndex, batchRoot: p.batch.batchRoot, bookHash: p.bookHash, fills: p.fillsTotal, rewardsRoot: p.batch.rewardsRoot, rewardsEpoch: p.batch.rewardsEpoch };
+      try { onEpoch({ ...e, digest: epochDigestOf(e) }, p.batch); } catch (err) { logFn(`[l3seq] onEpoch failed: ${err.message}`); }
+    }
+  }
+  const settled = async () => { while (pending.length || pumping) await (pumping || pump()); };
   /// re-append batches the log refused, oldest first; stops at the first failure so the log stays in order
   async function drain() {
     while (retry.length) {
@@ -191,11 +226,11 @@ export function createSequencer({
     shard: String(shard), topic, state: st, submit, record, seal, resume, slot,
     get index() { return index; }, get epoch() { return epoch; }, get prevRoot() { return prevRoot; },
     get ready() { return ready; }, get open() { return open.ops.length + queued.reduce((n, b) => n + b.ops.length, 0); },
-    async flush() { await sealSoon(); return chain; },
-    status: () => ({ shard: String(shard), index, epoch, prevRoot, open: open.ops.length + queued.reduce((n, b) => n + b.ops.length, 0), queued: queued.length, retry: retry.length, ready,
+    async flush() { await sealSoon(); await chain; await settled(); return chain; },
+    status: () => ({ shard: String(shard), index, epoch, prevRoot, open: open.ops.length + queued.reduce((n, b) => n + b.ops.length, 0), queued: queued.length, pending: pending.length, retry: retry.length, ready,
                      batchMs, batchMax, epochBatches, ...m, perBatchMs: m.batches ? Number((m.sealMs / m.batches).toFixed(3)) : 0,
                      state: st.stat ? st.stat() : { seq: st.seq } }),      // the rig's adapter has no books of its own to report
-    async stop() { stopped = true; if (timer) { clearTimeout(timer); timer = null; } try { await chain; } catch {} },
+    async stop() { stopped = true; if (timer) { clearTimeout(timer); timer = null; } try { await chain; await settled(); } catch {} },
   };
 }
 
@@ -265,7 +300,8 @@ export function createSequencerRig({
     const state = { ops: 0, get seq() { return this.ops; }, bookHash: () => bookHashOf([...books].flatMap((b) => b.m.orders())) };
     const seq = createSequencer({
       shard, state,
-      log: { kind: 'deferred', append: async (t, v) => (await ready()).append(t, v), offset: async (t) => (await ready()).offset(t), read: async (t, f, l) => (await ready()).read(t, f, l) },
+      log: { kind: 'deferred', append: async (t, v) => (await ready()).append(t, v), appendMany: async (t, vs) => (await ready()).appendMany(t, vs), offset: async (t) => (await ready()).offset(t), read: async (t, f, l) => (await ready()).read(t, f, l) },
+      appendBytes: Number(env.L3_APPEND_BYTES || 6 << 20),
       account: acct, batchMs, batchMax, epochBatches, logger: logFn, newBook,
       onSealed: (batch) => { quorum.announce(batch); },
       rewardsRoot: () => ({ root: rewards.epochRootOf(s0.closedEpoch), epoch: s0.closedEpoch }),
