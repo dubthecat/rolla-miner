@@ -41,7 +41,12 @@ let KECCAK = null, SECP = null;
 try { KECCAK = require('keccak'); } catch {}
 try { SECP = require('secp256k1'); if (typeof SECP.ecdsaRecover !== 'function') SECP = null; } catch {}
 export const NATIVE = { keccak: !!KECCAK, secp256k1: !!SECP };
-export const keccak256 = KECCAK ? (b) => new Uint8Array(KECCAK('keccak256').update(Buffer.from(b.buffer, b.byteOffset, b.byteLength)).digest()) : (b) => keccak_256(b);
+// one hasher, reset per call: the binding's hash object is a Transform stream and building one per call cost
+// ~12 µs of the ~13 µs a hash took; digest() already re-initializes the native state, so clearing _finalized is the whole reset
+let HASHER = null;
+export const keccak256 = KECCAK
+  ? (b) => { if (!HASHER) HASHER = KECCAK('keccak256'); else HASHER._finalized = false; HASHER.update(Buffer.from(b.buffer, b.byteOffset, b.byteLength)); return new Uint8Array(HASHER.digest()); }   // digest() re-initializes the state itself but leaves _finalized set
+  : (b) => keccak_256(b);
 const SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141n, SECP_HALF = SECP_N >> 1n;
 
 const ROLE = 'l3-verify';

@@ -165,9 +165,19 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     } catch (e) { if (/needs exactly 1/.test(e.message)) throw e; }
     known.add(topic);
   }
+  /// a topic that was just auto-created has no leader for a moment and the broker answers "This server does not
+  /// host this topic-partition" (or LEADER_NOT_AVAILABLE); a fresh shard's first offset/append/subscribe lands
+  /// exactly there, so those wait for leadership instead of failing the shard
+  const NO_LEADER = /does not host this topic-partition|LEADER_NOT_AVAILABLE|NOT_LEADER|UNKNOWN_TOPIC_OR_PARTITION|not the leader/i;
+  async function withLeader(what, fn, attempts = 20) {
+    for (let i = 0; ; i++) {
+      try { return await fn(); }
+      catch (e) { if (!NO_LEADER.test(e.message || '') || i >= attempts - 1) throw e; if (i === 0) logger && logger(`[l3log] ${what}: waiting for the partition leader (${e.message.slice(0, 60)})`); await new Promise((r) => setTimeout(r, 1000)); }
+    }
+  }
   async function send(topic, msgs) {
     await ensure(topic);
-    const r = await producer.send({ topic, acks, messages: msgs.map((m) => ({ key: String(m.shard ?? m.index ?? ''), value: enc(m) })) });
+    const r = await withLeader(`produce ${topic}`, () => producer.send({ topic, acks, messages: msgs.map((m) => ({ key: String(m.shard ?? m.index ?? ''), value: enc(m) })) }));
     const base = r?.[0]?.baseOffset ?? r?.[0]?.offset;
     return base != null ? Number(base) : -1;
   }
@@ -178,7 +188,7 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     async appendMany(topic, msgs) { return msgs.length ? send(topic, msgs) : this.offset(topic); },
     async offset(topic) {
       await ensure(topic);
-      const o = await admin.fetchTopicOffsets(topic);
+      const o = await withLeader(`offsets ${topic}`, () => admin.fetchTopicOffsets(topic));
       return Number(o?.[0]?.high ?? 0);
     },
     async read(topic, fromOffset = 0, limit = 500) {
@@ -197,7 +207,7 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
       // up to 16 MiB (8 MiB per partition, the broker's message limit) so one trip carries several batches.
       const consumer = kafka.consumer({ groupId, sessionTimeout: 30000, allowAutoTopicCreation: true, maxBytesPerPartition: 8 << 20, maxBytes: 16 << 20, maxWaitTimeInMs: 50 });
       await consumer.connect();
-      await consumer.subscribe({ topic, fromBeginning: true });
+      await withLeader(`subscribe ${topic}`, () => consumer.subscribe({ topic, fromBeginning: true }));
       let seeked = false;
       await consumer.run({
         eachMessage: async ({ message, partition }) => {

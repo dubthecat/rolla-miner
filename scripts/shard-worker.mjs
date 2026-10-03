@@ -18,14 +18,26 @@ const fastSign = (keyHex, digestHex) => { const { signature, recid } = SECP.ecds
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const post = (m) => parentPort.postMessage({ shard, ...m });
 
-const log = await createKafkaLog({ brokers: [brokers], clientId: `shard-${shard}`, logger: () => {} });
 const seqAcct = privateKeyToAccount(seqKey); const state = createShardState({});
 const sealed = [], finals = [], forks = [], sealedAt = new Map(), finalAt = new Map();
-const seq = createSequencer({ shard, log, account: seqAcct, state, batchMs: 60, batchMax: batch, epochBatches: epoch, onSealed: (b) => { sealed.push(b); sealedAt.set(b.index, Date.now()); }, logger: () => {} });
-await seq.resume();
-const quorum = createQuorum({ threshold, onFinal: (f) => { finals.push(f); finalAt.set(f.index, Date.now()); }, onFork: (f) => forks.push(f), logger: () => {} });
-await log.subscribe(ordersTopic(shard), 0, async ({ value }) => { quorum.announce(value); });
-await log.subscribe(votesTopic(shard), 0, async ({ value }) => { await quorum.vote(value); });
+let log = null, seq = null, quorum = null;
+// the setup touches freshly created topics; a broker that has not elected their leaders yet refuses the first
+// calls, so the whole setup is retried a few times before the shard gives up
+for (let attempt = 1; ; attempt++) {
+  try {
+    log = await createKafkaLog({ brokers: [brokers], clientId: `shard-${shard}`, logger: () => {} });
+    seq = createSequencer({ shard, log, account: seqAcct, state, batchMs: 60, batchMax: batch, epochBatches: epoch, onSealed: (b) => { sealed.push(b); sealedAt.set(b.index, Date.now()); }, logger: () => {} });
+    await seq.resume();
+    quorum = createQuorum({ threshold, onFinal: (f) => { finals.push(f); finalAt.set(f.index, Date.now()); }, onFork: (f) => forks.push(f), logger: () => {} });
+    await log.subscribe(ordersTopic(shard), 0, async ({ value }) => { quorum.announce(value); });
+    await log.subscribe(votesTopic(shard), 0, async ({ value }) => { await quorum.vote(value); });
+    break;
+  } catch (e) {
+    if (attempt >= 6) throw e;
+    post({ t: 'retry', attempt, error: e.message.slice(0, 100) }); try { await log?.close?.(); } catch {}
+    await sleep(3000);
+  }
+}
 
 // the workload: matcher.test.mjs's shape, eight traders, signed with libsecp256k1
 const domain = BOOK_DOMAIN(chainId, book); const E = 10n ** 18n; const token = '0x' + 'c0'.repeat(20); const MARKET = Number(shard);
