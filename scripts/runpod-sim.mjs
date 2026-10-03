@@ -16,6 +16,8 @@ const IMAGE = arg('--image', 'ghcr.io/dubthecat/rolla-miner:latest'), SIM_IMAGE 
 const BROKERS = arg('--brokers', process.env.L3_KAFKA_BROKERS || 'rolla-l3-broker.fly.dev:9092');
 const BOOK = process.env.PREDICT_BOOK || '0x7197A5160562516F6f8C4503dF03CD836a524D66', CHAIN_ID = String(process.env.CHAIN_ID || 46630);
 const THRESHOLD = Math.max(1, R - 1);
+// --extra-env K=V,K=V reaches every pod (sequencer host, miner hosts, cells): e.g. L3_COMMIT=tree,L3_COMMIT_NATIVE=1
+const EXTRA = Object.fromEntries(String(arg('--extra-env', '')).split(',').filter(Boolean).map((kv) => { const i = kv.indexOf('='); return [kv.slice(0, i), kv.slice(i + 1)]; }));
 const t0 = Date.now(); const say = (...a) => console.log(`+${((Date.now() - t0) / 1000).toFixed(0)}s`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FLAVORS = ['cpu3c', 'cpu5c', 'cpu3g', 'cpu5g', 'cpu3m', 'cpu5m'];
@@ -52,13 +54,13 @@ try {
     const seqKey = generatePrivateKey(), seqAddr = privateKeyToAccount(seqKey).address;
     say(`cross: ${S} shards · sequencer host ${SEQ_VCPU} vCPU · ${R} miner hosts × ${MINER_VCPU} vCPU (${S} miner processes × ${WORKERS} workers each) · ${N} orders/shard (${S * N}) · batches ${BATCH} · epochs ${EPOCH} · threshold ${THRESHOLD} · broker ${BROKERS}`);
     const seqPod = await rent({ name: `sim-seq-${base}`, image: IMAGE, ports: ['8080/http'], vcpu: SEQ_VCPU, diskGb: 20, cmd: ['node', 'scripts/sim-cell.mjs'],
-      env: { SIM_SHARD_LIST: SHARDS.join(','), SIM_ORDERS: String(N), SIM_BATCH: String(BATCH), SIM_EPOCH: String(EPOCH), SIM_REPLICAS: '0', SIM_THRESHOLD: String(THRESHOLD), SIM_SEQ_KEY: seqKey, SIM_LOCAL_BROKER: '0', L3_KAFKA_BROKERS: BROKERS, PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
+      env: { ...EXTRA, SIM_SHARD_LIST: SHARDS.join(','), SIM_ORDERS: String(N), SIM_BATCH: String(BATCH), SIM_EPOCH: String(EPOCH), SIM_REPLICAS: '0', SIM_THRESHOLD: String(THRESHOLD), SIM_SEQ_KEY: seqKey, SIM_LOCAL_BROKER: '0', L3_KAFKA_BROKERS: BROKERS, PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
     pods.push(seqPod); say('sequencer host', seqPod.id, seqPod.kind, `$${seqPod.costPerHr}/h`);
     const hosts = [];
     for (let r = 0; r < R; r++) {
       const keys = SHARDS.map(() => generatePrivateKey());
       const p = await rent({ name: `sim-miners-${base}-${r + 1}`, image: IMAGE, ports: ['8080/http'], vcpu: MINER_VCPU, diskGb: 40, cmd: ['node', 'scripts/sim-miners.mjs'],
-        env: { SIM_SHARDS: SHARDS.join(','), SIM_KEYS: keys.join(','), L3_KAFKA_BROKERS: BROKERS, L3_SEQUENCERS: seqAddr, L3_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
+        env: { ...EXTRA, SIM_SHARDS: SHARDS.join(','), SIM_KEYS: keys.join(','), L3_KAFKA_BROKERS: BROKERS, L3_SEQUENCERS: seqAddr, L3_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
       pods.push(p); hosts.push(p); say('miner host', r + 1, p.id, p.kind, `$${p.costPerHr}/h`);
     }
     say(`fleet $${pods.reduce((a, p) => a + (p.costPerHr || 0), 0).toFixed(2)}/h`);
@@ -74,13 +76,13 @@ try {
     for (const h of hosts) { try { const s = await getJson(h.url + '/healthz'); say(`${h.name}: ${s.miners.filter((m) => m.ok).length}/${s.count} ok`); for (const m of s.miners) say(`    shard ${m.shard} index ${m.index}${m.stalled ? ' STALLED ' + m.stalled : ''} · verify ${m.verifyMsPerOrder} ms/order (${m.workers} workers) · roots ${m.rootMsPerBatch} ms/batch · replay ${m.applyMsPerBatch} ms/batch · resting ${m.resting} · votes pending ${m.votesPending}`); } catch (e) { say(h.name, 'health failed', e.message.slice(0, 60)); } }
     say(`RESULT ${r.done && r.aggregate?.allFinal ? 'ALL SHARDS FINAL' : 'INCOMPLETE'} · sequenced ${r.aggregate?.seqRate} orders/s · finalized ${r.aggregate?.finalRate} orders/s`);
   } else {
-    say(`cells: ${CELLS} × (${S} shards × ${R} replicas, ${S * R} miner processes × ${WORKERS} workers, own broker) on ${CELL_VCPU} vCPU · ${N} orders/shard · batches ${BATCH} · epochs ${EPOCH}`);
+    say(`cells: ${CELLS} × (${S} shards × ${R} replicas, ${S * R} miner processes × ${WORKERS} workers, own broker) on ${CELL_VCPU} vCPU · ${N} orders/shard · batches ${BATCH} · epochs ${EPOCH}${Object.keys(EXTRA).length ? ' · env ' + Object.entries(EXTRA).map(([k, v]) => `${k}=${v}`).join(' ') : ''}`);
     // capacity is what it is: rent as many cells as RunPod has machines for (the requested size, then the fallback
     // size), and run with those rather than throwing away the ones already rented
     const cells = []; const FALLBACK_VCPU = Number(arg('--cell-vcpu-fallback', 32));
     for (let c = 0; c < CELLS; c++) {
       const base = 500000 + c * 1000 + Math.floor(Math.random() * 900);
-      const env = { SIM_SHARDS: String(S), SIM_BASE: String(base), SIM_ORDERS: String(N), SIM_BATCH: String(BATCH), SIM_EPOCH: String(EPOCH), SIM_REPLICAS: String(R), SIM_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), SIM_AUTOGO: '1', SIM_LOCAL_BROKER: '1', SIM_BROKER_SMP: arg('--broker-smp', '2'), SIM_BROKER_MEM: arg('--broker-mem', '3G'), PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID };
+      const env = { ...EXTRA, SIM_SHARDS: String(S), SIM_BASE: String(base), SIM_ORDERS: String(N), SIM_BATCH: String(BATCH), SIM_EPOCH: String(EPOCH), SIM_REPLICAS: String(R), SIM_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), SIM_AUTOGO: '1', SIM_LOCAL_BROKER: '1', SIM_BROKER_SMP: arg('--broker-smp', '2'), SIM_BROKER_MEM: arg('--broker-mem', '3G'), PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID };
       let p = null;
       for (const vcpu of [CELL_VCPU, FALLBACK_VCPU].filter((v, i, a) => v > 0 && a.indexOf(v) === i)) {
         try { p = await rent({ rounds: 1, name: `sim-cell-${base}`, image: SIM_IMAGE, ports: ['8080/http'], vcpu, diskGb: 80, cmd: ['node', 'scripts/sim-cell.mjs'], env: { ...env, SIM_WORKERS: vcpu < CELL_VCPU ? '1' : String(WORKERS) } }); p.vcpu = vcpu; break; }
