@@ -63,7 +63,7 @@ export async function getJson(url, { timeoutMs = 15000 } = {}) {
   try { const r = await fetch(url, { signal: ctl.signal }); const txt = await r.text(); try { return JSON.parse(txt); } catch { return { raw: txt.slice(0, 20000), status: r.status }; } } finally { clearTimeout(t); }
 }
 /// kill every miner-*/broker-* pod (a failed run must never keep billing)
-export async function sweep(prefixes = ['miner-', 'broker-', 'bench-']) {
+export async function sweep(prefixes = ['miner-', 'broker-', 'bench-', 'sim-']) {
   const pods = await listPods(); let n = 0;
   for (const p of pods) if (prefixes.some((x) => String(p.name || '').startsWith(x))) { await terminatePod(p.id); n++; console.log('terminated', p.id, p.name); }
   return n;

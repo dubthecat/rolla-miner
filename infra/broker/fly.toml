@@ -20,5 +20,5 @@ primary_region = "ams"
   destination = "/var/lib/redpanda/data"
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "1gb"
+  size = "performance-4x"
+  memory = "8gb"
