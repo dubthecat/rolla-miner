@@ -39,6 +39,7 @@
 // Everything in and out is a 0x-prefixed lower-case hex string, because that is what viem, the journal, the
 // JSON on the wire and Solidity all speak.
 import { keccak_256 } from '@noble/hashes/sha3';
+import { createRequire } from 'node:module';
 
 export const ZERO32 = '0x' + '00'.repeat(32);
 const LEAF = 0x00, NODE = 0x01, ROOT = 0x02;
@@ -73,7 +74,13 @@ export function bytes(h) {
   }
   return out;
 }
-export const keccak = (b) => hex(keccak_256(b));
+// Native keccak when the `keccak` binding is built for this platform (prebuilds for the common ones; pure-JS
+// noble otherwise): ~5 µs per hash against ~25 µs. Roots are two keccaks per leaf plus one per node, so a
+// 1000-order batch with its fills is ~3,000 hashes — 172 ms of a sequencer's seal in JS, ~45 ms native.
+let KECCAK = null; try { KECCAK = createRequire(import.meta.url)('keccak'); } catch {}
+export const NATIVE_KECCAK = !!KECCAK;
+export const keccak256 = KECCAK ? (b) => new Uint8Array(KECCAK('keccak256').update(Buffer.from(b.buffer, b.byteOffset, b.byteLength)).digest()) : (b) => keccak_256(b);
+export const keccak = (b) => hex(keccak256(b));
 
 // ------------------------------------------------------------------ abi.encode of static types, by hand
 /// a growable 32-byte-word writer. `word(bytes)` left-pads like abi.encode does for every static type.
@@ -105,7 +112,7 @@ export function tagged(tag, ...parts) {
   let n = 1; for (const p of parts) n += p.length;
   const b = new Uint8Array(n); b[0] = tag; let o = 1;
   for (const p of parts) { b.set(p, o); o += p.length; }
-  return keccak_256(b);
+  return keccak256(b);
 }
 
 // ------------------------------------------------------------------ leaves
@@ -149,8 +156,8 @@ const u32 = (n) => { const b = new Uint8Array(4); b[0] = (n >>> 24) & 255; b[1] 
 /// string and back cost more than the hashing did (it was most of the sequencer's seal time). Hex appears only
 /// at the boundary — the leaves coming in and the root going out.
 const NODE_BUF = new Uint8Array(65); NODE_BUF[0] = NODE;
-const pairB = (l, r) => { NODE_BUF.set(l, 1); NODE_BUF.set(r, 33); return keccak_256(NODE_BUF); };
-const apexB = (apex, count) => { const b = new Uint8Array(37); b[0] = ROOT; b.set(u32(count), 1); b.set(apex, 5); return hex(keccak_256(b)); };
+const pairB = (l, r) => { NODE_BUF.set(l, 1); NODE_BUF.set(r, 33); return keccak256(NODE_BUF); };
+const apexB = (apex, count) => { const b = new Uint8Array(37); b[0] = ROOT; b.set(u32(count), 1); b.set(apex, 5); return hex(keccak256(b)); };
 const apexRoot = (apexHex, count) => apexB(bytes(apexHex), count);
 const pair = (l, r) => hex(pairB(bytes(l), bytes(r)));
 
