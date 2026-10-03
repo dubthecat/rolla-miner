@@ -1,8 +1,8 @@
 // native/book/commit_bench.mjs — the JavaScript commit tree (engine/l3/miner/commit.js) under the workload of
 // commit_bench.cpp, scaled down: n inserts, n/2 partial fills, n/2 removes, µs per operation for each phase.
 //   node commit_bench.mjs [n=100000]
-import { createCommitTree } from '../../engine/l3/miner/commit.js';
-import { keccak256, NATIVE_KECCAK } from '../../engine/l3/miner/merkle.js';
+import { createCommitTree } from '../../src/miner/commit.js';
+import { keccak256, NATIVE_KECCAK } from '../../src/miner/merkle.js';
 
 const n = Number(process.argv[2] || 100000);
 let s = 0x5eed; const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;

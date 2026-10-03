@@ -10,3 +10,8 @@ native/book/bookd
 native/book/libbook.so
 data/
 *.log
+native/book/commit_test
+native/book/commit_test_asan
+native/book/commit_trace
+native/book/commit_bench
+native/book/commit_bench3

@@ -9,8 +9,8 @@
 import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createCommitTree, verifyCommitProof, encodeCommitProof } from '../../engine/l3/miner/commit.js';
-import { hex, bytes } from '../../engine/l3/miner/merkle.js';
+import { createCommitTree, verifyCommitProof, encodeCommitProof } from '../../src/miner/commit.js';
+import { hex, bytes } from '../../src/miner/merkle.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SELF = fileURLToPath(import.meta.url);

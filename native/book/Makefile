@@ -67,7 +67,7 @@ test: book_test trace bookd commit_test commit_trace
 	@echo "== C++ commit tree tests (keccak vectors, the Merkle-treap, the C ABI)"
 	./commit_test
 	@echo "== Node commit tree tests (the JavaScript reference)"
-	cd ../../ && $(NODE) --test engine/l3/miner/commit.test.mjs
+	cd ../../ && $(NODE) --test src/miner/commit.test.mjs
 	@echo "== differential: commit.js vs the native commit tree, seeds 3 and 5 at 100k ops"
 	$(NODE) commit_diff.mjs
 
