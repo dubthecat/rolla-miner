@@ -1,12 +1,14 @@
 // scripts/runpod-bench.mjs — the verification ceiling of real machines: rent pods of several sizes on RunPod, run
 // src/miner/bench-verify.mjs on each (the miner image, a different start command), collect /results, terminate.
-//   RUNPOD_API_KEY=… node scripts/runpod-bench.mjs [--sizes 8,16,32,64] [--orders 50000] [--flavor cpu5c] [--gpu]
+//   RUNPOD_API_KEY=… node scripts/runpod-bench.mjs [--sizes 8,16,32,64] [--orders 50000] [--flavor cpu5c] [--gpu] [--procs 4] [--workers 8,16]
+// --procs P runs P bench processes at once on each pod (summed per ladder step): a per-process cap vs the cores
 // --gpu rents GPU hosts instead (minVCPUPerGPU = size) for when the CPU fleet is empty. Pods are named bench-* so
 // `node scripts/runpod.mjs sweep` kills strays.
 import { createPod, waitRunning, podInfo, endpoint, terminatePod, getJson } from './runpod.mjs';
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
 const flag = (k) => process.argv.includes(k);
 const SIZES = String(arg('--sizes', '8,16,32,64')).split(',').map(Number), ORDERS = Number(arg('--orders', 50000)), FLAVOR = arg('--flavor', 'cpu5c');
+const PROCS = Number(arg('--procs', 1)), WORKERS = arg('--workers', '');
 const IMAGE = arg('--image', 'ghcr.io/dubthecat/rolla-miner:latest');
 const FLAVORS = [FLAVOR, 'cpu3c', 'cpu5c', 'cpu3g', 'cpu5g', 'cpu3m', 'cpu5m'].filter((f, i, a) => a.indexOf(f) === i);
 const GPUS = ['NVIDIA GeForce RTX 4090', 'NVIDIA RTX A6000', 'NVIDIA A100 80GB PCIe', 'NVIDIA H100 PCIe', 'NVIDIA L40S', 'NVIDIA GeForce RTX 3090'];
@@ -14,7 +16,7 @@ const t0 = Date.now(); const say = (...a) => console.log(`+${((Date.now() - t0) 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pods = [];
 async function rent(size) {
-  const base = { name: `bench-${size}-${Math.floor(Math.random() * 1e5)}`, image: IMAGE, ports: ['8080/http'], diskGb: 10, cmd: ['node', 'src/miner/bench-verify.mjs'], env: { PORT: '8080', BENCH_ORDERS: String(ORDERS) } };
+  const base = { name: `bench-${size}-${Math.floor(Math.random() * 1e5)}`, image: IMAGE, ports: ['8080/http'], diskGb: 10, cmd: ['node', 'src/miner/bench-verify.mjs'], env: { PORT: '8080', BENCH_ORDERS: String(ORDERS), BENCH_PROCS: String(PROCS), ...(WORKERS ? { BENCH_WORKERS: WORKERS } : {}) } };
   const tried = []; let last = null;
   if (!flag('--gpu')) for (const cloud of ['SECURE', 'COMMUNITY']) for (const flavor of FLAVORS) { try { const p = await createPod({ ...base, vcpu: size, flavor, cloud }); return { ...p, size, kind: `${cloud} ${flavor} × ${size}` }; } catch (e) { last = e; tried.push(`${cloud} ${flavor}`); } }
   for (const cloud of ['SECURE', 'COMMUNITY']) for (const gpu of GPUS) { try { const p = await createPod({ ...base, vcpu: size, cloud, gpu }); return { ...p, size, kind: `${cloud} ${gpu} ≥${size} vCPU` }; } catch (e) { last = e; tried.push(`${cloud} ${gpu}`); } }
@@ -31,8 +33,9 @@ try {
       if (!r || !r.done) { say(p.name, 'no result in time'); continue; }
       say(p.name, r.machine, 'native', JSON.stringify(r.native));
       for (const row of r.ladder) say(`  workers ${String(row.workers).padStart(3)} · ${String(row.ordersPerSec).padStart(7)} orders/s · ${row.perWorker}/s per worker · ${row.usPerOrder} µs/order wall · ok ${row.ok}/${r.orders}`);
+      for (const row of r.multi || []) say(`  ${row.procs} procs × ${String(row.workers).padStart(2)} workers · ${String(row.ordersPerSec).padStart(7)} orders/s total · ${Math.round(row.ordersPerSec / row.procs)} per process · ok ${row.ok}/${r.orders * row.procs}`);
       if (r.ed25519) say(`  ed25519 one thread: ${r.ed25519.perCore}/s · ${r.ed25519.usPerVerify} µs · ${r.ed25519.ratioVsSecp}× vs secp256k1`);
-      out.push({ size: p.size, kind: p.kind, costPerHr: p.costPerHr, machine: r.machine, best: r.ladder.reduce((a, b) => (b.ordersPerSec > (a?.ordersPerSec || 0) ? b : a), null), ed25519: r.ed25519 });
+      out.push({ size: p.size, kind: p.kind, costPerHr: p.costPerHr, machine: r.machine, best: [...r.ladder, ...(r.multi || [])].reduce((a, b) => (b.ordersPerSec > (a?.ordersPerSec || 0) ? b : a), null), ed25519: r.ed25519 });
     } catch (e) { say(p.name, 'failed:', e.message.slice(0, 160)); }
     finally { try { await terminatePod(p.id); say('terminated', p.name); } catch {} }
   }

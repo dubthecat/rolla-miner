@@ -6,6 +6,8 @@
 //   node engine/l3/miner/bench-verify.mjs                       # ladder 1,2,4,… up to cpus-1 workers
 //   BENCH_ORDERS=50000 BENCH_WORKERS=8,16,32 node …             # your own ladder
 //   PORT=8080 node …                                             # also serve /results (JSON) for an orchestrator
+//   BENCH_PROCS=4 BENCH_WORKERS=8,16 node …                      # 4 processes at once, summed per ladder step —
+//                                                                  tells a per-process cap (the worker hand-off) from the cores
 //
 // Orders are signed with libsecp256k1 (RFC 6979, byte-identical to viem) so 100k take seconds; the ed25519 line
 // is node:crypto (OpenSSL) on one thread — the per-signature cost ratio secp256k1-recover : ed25519-verify is
@@ -15,6 +17,8 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
+import { fork } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createVerifier, orderHash, NATIVE } from './verify.js';
 import { BOOK_DOMAIN, l3OrderFor, serializeL3Order } from '../desk.js';
 
@@ -22,10 +26,29 @@ const env = process.env;
 const N = Number(env.BENCH_ORDERS || 20000);
 const cpus = os.cpus()?.length || 1;
 const ladder = env.BENCH_WORKERS ? env.BENCH_WORKERS.split(',').map(Number) : (() => { const l = [1]; for (let w = 2; w <= cpus - 1; w *= 2) l.push(w); if (!l.includes(cpus - 1) && cpus - 1 > 1) l.push(cpus - 1); return l; })();
-const results = { machine: `${cpus} vCPU · ${os.cpus()?.[0]?.model || '?'} · node ${process.version}`, native: NATIVE, orders: N, ladder: [], ed25519: null, done: false, startedAt: Date.now() };
-const say = (...a) => console.log(...a);
+const PROCS = Number(env.BENCH_PROCS || 1), CHILD = env.BENCH_CHILD === '1';
+const results = { machine: `${cpus} vCPU · ${os.cpus()?.[0]?.model || '?'} · node ${process.version}`, native: NATIVE, orders: N, procs: PROCS, ladder: [], multi: [], ed25519: null, done: false, startedAt: Date.now() };
+const say = (...a) => { if (!CHILD) console.log(...a); };
 
-if (env.PORT) http.createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(req.url === '/results' ? results : { ok: true, done: results.done })); }).listen(Number(env.PORT), () => say(`serving /results on ${env.PORT}`));
+if (env.PORT && !CHILD) http.createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(req.url === '/results' ? results : { ok: true, done: results.done })); }).listen(Number(env.PORT), () => say(`serving /results on ${env.PORT}`));
+
+// ---- several processes at once: fork children, release them together, sum each ladder step ----
+if (PROCS > 1 && !CHILD) {
+  say(results.machine, '· native', JSON.stringify(NATIVE), `· ${PROCS} processes × ${N} orders each`);
+  const kids = Array.from({ length: PROCS }, () => fork(fileURLToPath(import.meta.url), [], { env: { ...env, BENCH_CHILD: '1', BENCH_PROCS: '1', PORT: '' }, stdio: ['ignore', 'ignore', 'inherit', 'ipc'] }));
+  const rows = new Map(); let signed = 0, finished = 0;
+  await new Promise((resolve) => {
+    for (const k of kids) k.on('message', (msg) => {
+      if (msg.t === 'signed') { if (++signed === kids.length) for (const x of kids) x.send('go'); }
+      if (msg.t === 'row') { const r = rows.get(msg.row.workers) || { workers: msg.row.workers, procs: 0, ordersPerSec: 0, ok: 0, ms: 0 }; r.procs++; r.ordersPerSec += msg.row.ordersPerSec; r.ok += msg.row.ok; r.ms = Math.max(r.ms, msg.row.ms); rows.set(msg.row.workers, r); }
+      if (msg.t === 'done') { if (++finished === kids.length) resolve(); }
+    });
+  });
+  for (const r of [...rows.values()].sort((a, b) => a.workers - b.workers)) { results.multi.push(r); say(`${r.procs} procs × ${String(r.workers).padStart(2)} workers · ${String(r.ordersPerSec).padStart(7)} orders/s total · ${Math.round(r.ordersPerSec / r.procs)} per process · ok ${r.ok}/${N * r.procs}`); }
+  results.done = true; results.ms = Date.now() - results.startedAt;
+  say('RESULT', JSON.stringify(results));
+  if (!env.PORT) process.exit(0);
+} else {
 
 const SECP = createRequire(import.meta.url)('secp256k1');
 const h2b = (h) => Uint8Array.from(Buffer.from(h.slice(2), 'hex'));
@@ -42,6 +65,7 @@ for (let i = 0; i < N; i++) {
   const order = serializeL3Order(o); items.push({ order, signature: fastSign(k.key, orderHash(domain, order)), expect: k.address.toLowerCase() });
 }
 say(`signed ${N} orders in ${Date.now() - t} ms (${Math.round(N / (Date.now() - t) * 1000)}/s, one thread, libsecp256k1)`);
+if (CHILD) { process.send({ t: 'signed' }); await new Promise((r) => process.on('message', (m) => m === 'go' && r())); }
 
 for (const w of ladder) {
   const v = createVerifier({ domain, workers: w, logger: () => {} });
@@ -52,7 +76,7 @@ for (const w of ladder) {
   let ok = 0; for (let i = 0; i < out.length; i++) if (out[i] && out[i].signer === items[i].expect) ok++;
   await v.close();
   const row = { workers: v.workers, ms: Math.round(ms), ordersPerSec: Math.round(N / ms * 1000), perWorker: Math.round(N / ms * 1000 / Math.max(1, v.workers)), usPerOrder: Number((ms * 1000 / N).toFixed(1)), ok };
-  results.ladder.push(row);
+  results.ladder.push(row); if (CHILD) process.send({ t: 'row', row });
   say(`workers ${String(row.workers).padStart(2)} · ${row.ordersPerSec.toString().padStart(7)} orders/s · ${row.perWorker}/s per worker · ${row.usPerOrder} µs/order wall · ${ok}/${N} ok`);
   if (ok !== N) { say('VERIFICATION MISMATCH'); process.exitCode = 1; }
 }
@@ -70,4 +94,6 @@ for (const w of ladder) {
 }
 results.done = true; results.ms = Date.now() - results.startedAt;
 say('RESULT', JSON.stringify(results));
+if (CHILD) { process.send({ t: 'done' }); process.exit(process.exitCode || 0); }
 if (!env.PORT) process.exit(process.exitCode || 0);
+}
