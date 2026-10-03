@@ -22,7 +22,7 @@ const FLAVORS = ['cpu3c', 'cpu5c', 'cpu3g', 'cpu5g', 'cpu3m', 'cpu5m'];
 const GPUS = ['NVIDIA GeForce RTX 4090', 'NVIDIA RTX A6000', 'NVIDIA L40S', 'NVIDIA A100 80GB PCIe', 'NVIDIA H100 PCIe', 'NVIDIA GeForce RTX 3090', 'NVIDIA RTX A5000'];
 async function rent(opts) {
   let last = null; const tried = [];
-  for (let round = 0; round < 2; round++) {
+  for (let round = 0; round < (opts.rounds ?? 2); round++) {
     for (const cloud of ['SECURE', 'COMMUNITY']) {
       for (const flavor of FLAVORS) { try { const p = await createPod({ ...opts, flavor, cloud }); return { ...p, kind: `${cloud} ${flavor} × ${opts.vcpu}` }; } catch (e) { last = e; tried.push(`${cloud} ${flavor}`); } }
       for (const gpu of GPUS) { try { const p = await createPod({ ...opts, cloud, gpu }); return { ...p, kind: `${cloud} ${gpu} ≥${opts.vcpu} vCPU` }; } catch (e) { last = e; tried.push(`${cloud} ${gpu}`); } }
@@ -75,13 +75,21 @@ try {
     say(`RESULT ${r.done && r.aggregate?.allFinal ? 'ALL SHARDS FINAL' : 'INCOMPLETE'} · sequenced ${r.aggregate?.seqRate} orders/s · finalized ${r.aggregate?.finalRate} orders/s`);
   } else {
     say(`cells: ${CELLS} × (${S} shards × ${R} replicas, ${S * R} miner processes × ${WORKERS} workers, own broker) on ${CELL_VCPU} vCPU · ${N} orders/shard · batches ${BATCH} · epochs ${EPOCH}`);
-    const cells = [];
+    // capacity is what it is: rent as many cells as RunPod has machines for (the requested size, then the fallback
+    // size), and run with those rather than throwing away the ones already rented
+    const cells = []; const FALLBACK_VCPU = Number(arg('--cell-vcpu-fallback', 32));
     for (let c = 0; c < CELLS; c++) {
       const base = 500000 + c * 1000 + Math.floor(Math.random() * 900);
-      const p = await rent({ name: `sim-cell-${base}`, image: SIM_IMAGE, ports: ['8080/http'], vcpu: CELL_VCPU, diskGb: 80, cmd: ['node', 'scripts/sim-cell.mjs'],
-        env: { SIM_SHARDS: String(S), SIM_BASE: String(base), SIM_ORDERS: String(N), SIM_BATCH: String(BATCH), SIM_EPOCH: String(EPOCH), SIM_REPLICAS: String(R), SIM_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), SIM_AUTOGO: '1', SIM_LOCAL_BROKER: '1', SIM_BROKER_SMP: arg('--broker-smp', '2'), SIM_BROKER_MEM: arg('--broker-mem', '3G'), PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
+      const env = { SIM_SHARDS: String(S), SIM_BASE: String(base), SIM_ORDERS: String(N), SIM_BATCH: String(BATCH), SIM_EPOCH: String(EPOCH), SIM_REPLICAS: String(R), SIM_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), SIM_AUTOGO: '1', SIM_LOCAL_BROKER: '1', SIM_BROKER_SMP: arg('--broker-smp', '2'), SIM_BROKER_MEM: arg('--broker-mem', '3G'), PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID };
+      let p = null;
+      for (const vcpu of [CELL_VCPU, FALLBACK_VCPU].filter((v, i, a) => v > 0 && a.indexOf(v) === i)) {
+        try { p = await rent({ rounds: 1, name: `sim-cell-${base}`, image: SIM_IMAGE, ports: ['8080/http'], vcpu, diskGb: 80, cmd: ['node', 'scripts/sim-cell.mjs'], env: { ...env, SIM_WORKERS: vcpu < CELL_VCPU ? '1' : String(WORKERS) } }); p.vcpu = vcpu; break; }
+        catch (e) { say(`cell ${c + 1}: no ${vcpu}-vCPU machine (${e.message.slice(0, 60)})`); }
+      }
+      if (!p) { say(`cell ${c + 1}: no capacity — running with the ${cells.length} rented`); break; }
       pods.push(p); cells.push(p); say('cell', c + 1, p.id, p.kind, `$${p.costPerHr}/h`);
     }
+    if (!cells.length) throw new Error('no capacity for a single cell');
     say(`fleet $${pods.reduce((a, p) => a + (p.costPerHr || 0), 0).toFixed(2)}/h`);
     for (const c of cells) { try { await up(c); say(c.name, 'running', c.url); } catch (e) { say(c.name, 'did not start:', e.message.slice(0, 80)); c.dead = true; } }
     const results = new Map(); const deadline = Date.now() + 1500000;
