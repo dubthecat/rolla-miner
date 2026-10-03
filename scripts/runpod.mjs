@@ -16,8 +16,11 @@ async function call(method, path, body) {
 }
 
 /// a CPU pod from a public image. ports: ['9092/tcp'] gets a public ip:port, ['8080/http'] a proxy URL.
-export async function createPod({ name, image, env = {}, ports = ['8080/http'], vcpu = 2, flavor = 'cpu3c', cloud = 'SECURE', diskGb = 10, cmd = null, entrypoint = null, publicIp = false }) {
-  const body = { name, imageName: image, computeType: 'CPU', cpuFlavorIds: [flavor], vcpuCount: vcpu, cloudType: cloud, containerDiskInGb: diskGb, volumeInGb: 0, ports, env, supportPublicIp: publicIp || ports.some((p) => p.endsWith('/tcp')), ...(cmd ? { dockerStartCmd: cmd } : {}), ...(entrypoint ? { dockerEntrypoint: entrypoint } : {}) };
+export async function createPod({ name, image, env = {}, ports = ['8080/http'], vcpu = 2, flavor = 'cpu3c', cloud = 'SECURE', diskGb = 10, cmd = null, entrypoint = null, publicIp = false, gpu = null }) {
+  // gpu: a GPU type id (e.g. 'NVIDIA GeForce RTX 3090') makes this a GPU pod — the miner image is CPU-only but runs anywhere;
+  // GPU hosts are what RunPod has most of when the CPU fleet in the default data centers is empty
+  const compute = gpu ? { computeType: 'GPU', gpuTypeIds: [gpu], gpuCount: 1, minVCPUPerGPU: 2 } : { computeType: 'CPU', cpuFlavorIds: [flavor], vcpuCount: vcpu };
+  const body = { name, imageName: image, ...compute, cloudType: cloud, containerDiskInGb: diskGb, volumeInGb: 0, ports, env, supportPublicIp: publicIp || ports.some((p) => p.endsWith('/tcp')), ...(cmd ? { dockerStartCmd: cmd } : {}), ...(entrypoint ? { dockerEntrypoint: entrypoint } : {}) };
   const d = await call('POST', '/pods', body);
   return { id: d.id, name, costPerHr: d.costPerHr ?? null };
 }

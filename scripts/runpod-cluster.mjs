@@ -8,10 +8,16 @@ import { createPod, waitRunning, endpoint, terminatePod, getJson, podInfo } from
 const FLAVORS = ['cpu3c', 'cpu5c', 'cpu3g', 'cpu5g', 'cpu3m', 'cpu5m'];
 /// RunPod says 500 "Something went wrong" when a flavor has no instance with that many vCPUs: walk the flavors, then halve the vCPUs
 async function createPodOnLadder(opts) {
-  let lastErr = null;
-  for (const vcpu of [opts.vcpu, Math.max(2, Math.floor(opts.vcpu / 2))]) for (const flavor of [opts.flavor, ...FLAVORS.filter((f) => f !== opts.flavor)]) {
-    try { const p = await createPod({ ...opts, vcpu, flavor }); return { ...p, vcpu, flavor }; }
-    catch (e) { lastErr = e; console.log(`  no pod on ${flavor} × ${vcpu} vCPU: ${e.message.slice(0, 90)}`); }
+  let lastErr = null; const tried = [];
+  const GPUS = ['NVIDIA GeForce RTX 3090', 'NVIDIA RTX A4500', 'NVIDIA RTX A5000', 'NVIDIA GeForce RTX 4090', 'NVIDIA GeForce RTX 3070'];
+  for (let round = 0; round < 2; round++) {
+    for (const cloud of ['SECURE', 'COMMUNITY']) {
+      for (const vcpu of [opts.vcpu, Math.max(2, Math.floor(opts.vcpu / 2))]) for (const flavor of [opts.flavor, ...FLAVORS.filter((f) => f !== opts.flavor)]) {
+        try { const p = await createPod({ ...opts, vcpu, flavor, cloud }); return { ...p, vcpu, flavor, cloud }; } catch (e) { lastErr = e; tried.push(`${cloud} ${flavor}×${vcpu}`); }
+      }
+      for (const gpu of GPUS) { try { const p = await createPod({ ...opts, cloud, gpu }); return { ...p, vcpu: 'gpu', flavor: gpu, cloud }; } catch (e) { lastErr = e; tried.push(`${cloud} ${gpu}`); } }
+    }
+    console.log(`  no instance on any of ${tried.length} rungs (${lastErr.message.slice(0, 80)}) — waiting 30 s before the second round`); await new Promise((r) => setTimeout(r, 30000));
   }
   throw lastErr;
 }
@@ -66,7 +72,7 @@ try {
   for (let i = 0; i < N_MINERS; i++) {
     const p = await createPodOnLadder({ name: `miner-${SHARD}-${i + 1}`, image: IMAGE, ports: ['8080/http'], vcpu: VCPU, flavor: FLAVOR, diskGb: 10,
       env: { L3_LOG: 'kafka', L3_KAFKA_BROKERS: brokers, L3_SHARD: SHARD, L3_MINER_KEY: minerKeys[i], PREDICT_BOOK: BOOK, CHAIN_ID: String(CHAIN_ID), L3_SEQUENCERS: seqAcct.address, L3_THRESHOLD: String(THRESHOLD), L3_VERIFY_WORKERS: String(Math.max(1, VCPU - 1)),   /* re-set below from the vCPUs actually granted */ PORT: '8080', DATA_DIR: '/data' } });
-    pods.push(p); miners.push({ ...p, address: minerAddrs[i] }); say('miner pod', i + 1, p.id, minerAddrs[i], `${p.flavor} × ${p.vcpu} vCPU`, `$${p.costPerHr}/h`);
+    pods.push(p); miners.push({ ...p, address: minerAddrs[i] }); say('miner pod', i + 1, p.id, minerAddrs[i], `${p.cloud} ${p.flavor} × ${p.vcpu}`, `$${p.costPerHr}/h`);
   }
   for (const m of miners) { const info = await waitRunning(m.id, { timeoutMs: 420000 }); m.url = endpoint(info, 8080); }
   for (const m of miners) { let ok = false; for (let i = 0; i < 60 && !ok; i++) { try { const h = await getJson(m.url + '/healthz'); ok = h && (h.ok === true || h.status === 'ok' || h.index != null); if (!ok && i % 6 === 0) say(m.name, 'health:', JSON.stringify(h).slice(0, 100)); } catch {} if (!ok) await sleep(5000); } say(m.name, ok ? 'healthy' : 'NOT healthy after 5 min', m.url); }
