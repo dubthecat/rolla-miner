@@ -192,7 +192,10 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     async subscribe(topic, fromOffset, handler) {
       await ensure(topic);
       const groupId = `${groupPrefix}-${topic}-${Math.random().toString(36).slice(2, 10)}`;
-      const consumer = kafka.consumer({ groupId, sessionTimeout: 30000, allowAutoTopicCreation: true });
+      // a batch of 2,000 orders is ~1.2 MB; kafkajs's default fetch (1 MiB per partition) then carries ONE batch per
+      // round trip, and a miner far from the broker pays that round trip per batch on top of its own work. Fetch
+      // up to 16 MiB (8 MiB per partition, the broker's message limit) so one trip carries several batches.
+      const consumer = kafka.consumer({ groupId, sessionTimeout: 30000, allowAutoTopicCreation: true, maxBytesPerPartition: 8 << 20, maxBytes: 16 << 20, maxWaitTimeInMs: 50 });
       await consumer.connect();
       await consumer.subscribe({ topic, fromBeginning: true });
       let seeked = false;
