@@ -9,17 +9,25 @@ import path from 'node:path';
 
 const env = process.env;
 const here = path.dirname(fileURLToPath(import.meta.url));
-export function spawnMiners({ shards, keys, brokers, sequencers, threshold, workers, basePort = 9100, dataDir = env.DATA_DIR || '/data', extra = {} }) {
+/// one miner process per shard. A miner that exits (a broker not yet serving, a transient error) is restarted
+/// with a 3 s backoff, up to `restarts` times; `onLog` gets the exits so a host can show them in its own log.
+export function spawnMiners({ shards, keys, brokers, sequencers, threshold, workers, basePort = 9100, dataDir = env.DATA_DIR || '/data', extra = {}, restarts = 8, onLog = (l) => console.log(l) }) {
   const miners = [];
   shards.forEach((shard, i) => {
     const port = basePort + i;
-    const child = spawn(process.execPath, [path.join(here, '..', 'src', 'miner', 'run.mjs')], {
-      stdio: ['ignore', 'inherit', 'inherit'],
-      env: { ...env, ...extra, L3_LOG: 'kafka', L3_KAFKA_BROKERS: brokers, L3_SHARD: String(shard), L3_MINER_KEY: keys[i], L3_SEQUENCERS: sequencers, L3_THRESHOLD: String(threshold),
-             L3_VERIFY_WORKERS: String(workers), PORT: String(port), DATA_DIR: path.join(dataDir, `m-${shard}`) },
-    });
-    child.on('exit', (code, sig) => console.log(`[sim-miners] miner ${shard} exited (${code ?? sig})`));
-    miners.push({ shard: String(shard), port, child, url: `http://127.0.0.1:${port}` });
+    const m = { shard: String(shard), port, child: null, url: `http://127.0.0.1:${port}`, exits: 0, stopped: false };
+    const start = () => {
+      m.child = spawn(process.execPath, [path.join(here, '..', 'src', 'miner', 'run.mjs')], {
+        stdio: ['ignore', 'inherit', 'inherit'],
+        env: { ...env, ...extra, L3_LOG: 'kafka', L3_KAFKA_BROKERS: brokers, L3_SHARD: String(shard), L3_MINER_KEY: keys[i], L3_SEQUENCERS: sequencers, L3_THRESHOLD: String(threshold),
+               L3_VERIFY_WORKERS: String(workers), PORT: String(port), DATA_DIR: path.join(dataDir, `m-${shard}`) },
+      });
+      m.child.on('exit', (code, sig) => {
+        m.exits++; onLog(`[sim-miners] miner ${shard} (port ${port}) exited (${code ?? sig}), exit #${m.exits}`);
+        if (!m.stopped && m.exits <= restarts) setTimeout(start, 3000); else if (!m.stopped) onLog(`[sim-miners] miner ${shard} gave up after ${m.exits} exits`);
+      });
+    };
+    start(); miners.push(m);
   });
   return miners;
 }
@@ -55,6 +63,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const miners = spawnMiners({ shards, keys, brokers: env.L3_KAFKA_BROKERS, sequencers: env.L3_SEQUENCERS || '', threshold: Number(env.L3_THRESHOLD || 2), workers: Number(env.SIM_WORKERS || 2) });
   console.log(`[sim-miners] ${miners.length} miner process(es): shards ${shards.join(' ')} · ${env.SIM_WORKERS || 2} verify worker(s) each · broker ${env.L3_KAFKA_BROKERS}`);
   serveMiners(miners, Number(env.PORT || 8080));
-  const bye = () => { for (const m of miners) { try { m.child.kill('SIGTERM'); } catch {} } setTimeout(() => process.exit(0), 2000); };
+  const bye = () => { for (const m of miners) { m.stopped = true; try { m.child && m.child.kill('SIGTERM'); } catch {} } setTimeout(() => process.exit(0), 2000); };
   process.on('SIGTERM', bye); process.on('SIGINT', bye);
 }

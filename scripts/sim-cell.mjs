@@ -16,6 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { spawnMiners, minersHealth, minersMetrics } from './sim-miners.mjs';
+import { createKafkaLog } from '../src/miner/log.js';
 
 const env = process.env; const here = path.dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -42,8 +43,18 @@ async function startBroker() {
   const cmd = hasUser ? ['runuser', '-u', 'redpanda', '--', 'rpk', ...args] : ['rpk', ...args];
   say('[cell] starting broker:', cmd.slice(0, 6).join(' '), '…');
   const p = spawn(cmd[0], cmd.slice(1), { stdio: ['ignore', 'inherit', 'inherit'] }); p.on('exit', (c, sg) => say('[cell] broker exited', c ?? sg));
-  for (let i = 0; i < 180; i++) { if (await portOpen(9092)) { await sleep(2000); state.broker = 'up'; say('[cell] broker up on 127.0.0.1:9092'); return; } await sleep(1000); }
-  throw new Error('the broker did not open 9092 in 180 s');
+  for (let i = 0; i < 180; i++) { if (await portOpen(9092)) break; await sleep(1000); }
+  if (!(await portOpen(9092))) throw new Error('the broker did not open 9092 in 180 s');
+  // the port opens before the broker serves: prove it with a real client (create a topic, append, read back)
+  for (let i = 0; i < 60; i++) {
+    try {
+      const log = await createKafkaLog({ brokers: ['127.0.0.1:9092'], clientId: 'cell-probe', logger: () => {} });
+      const topic = 'probe.cell'; await log.append(topic, { i, at: Date.now() }); const n = await log.offset(topic); try { await log.close?.(); } catch {}
+      if (n > 0) { state.broker = 'up'; say(`[cell] broker serving on 127.0.0.1:9092 (probe offset ${n})`); return; }
+    } catch (e) { if (i % 10 === 0) say('[cell] broker not serving yet:', e.message.slice(0, 80)); }
+    await sleep(2000);
+  }
+  throw new Error('the broker opened 9092 but never served a produce/fetch');
 }
 
 async function main() {
@@ -52,14 +63,16 @@ async function main() {
   // local miners: one process per (shard, replica)
   for (let r = 0; r < R; r++) {
     const keys = SHARDS.map(() => generatePrivateKey());
-    const ms = spawnMiners({ shards: SHARDS, keys, brokers, sequencers: seqAddr, threshold: THRESHOLD, workers: WORKERS, basePort: 9100 + r * 100, dataDir: path.join(env.DATA_DIR || '/data', `r${r + 1}`) });
+    const ms = spawnMiners({ shards: SHARDS, keys, brokers, sequencers: seqAddr, threshold: THRESHOLD, workers: WORKERS, basePort: 9100 + r * 100, dataDir: path.join(env.DATA_DIR || '/data', `r${r + 1}`), onLog: (l) => say(l) });
     localMiners.push(...ms.map((m) => ({ ...m, replica: r + 1 })));
   }
   if (localMiners.length) {
     say(`[cell] ${localMiners.length} miner processes · ${WORKERS} verify worker(s) each`);
     const deadline = Date.now() + 300000; let ok = false;
-    while (Date.now() < deadline) { const h = await minersHealth(localMiners); if (h.length && h.every((m) => m.ok)) { ok = true; break; } await sleep(4000); }
-    if (!ok) throw new Error('local miners never all healthy'); say('[cell] all local miners healthy');
+    let lastH = null;
+    while (Date.now() < deadline) { const h = await minersHealth(localMiners, { timing: false }); lastH = h; if (h.length && h.every((m) => m.ok)) { ok = true; break; } await sleep(4000); }
+    if (!ok) { const bad = (lastH || []).filter((m) => !m.ok); throw new Error(`local miners never all healthy: ${bad.length} unhealthy — ${bad.slice(0, 4).map((m) => `${m.shard}: ${m.stalled || m.error || 'not ok'}`).join('; ')}`); }
+    say('[cell] all local miners healthy');
   }
   // the shards: a thread each; they sign, then wait for go
   workers = SHARDS.map((shard, i) => new Worker(path.join(here, 'shard-worker.mjs'), { workerData: { shard, brokers, orders: N, batch: BATCH, epoch: EPOCH, threshold: THRESHOLD, seqKey, book: BOOK, chainId: CHAIN_ID, seed: 11 + i } }));
