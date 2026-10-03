@@ -60,7 +60,7 @@ export function endpoint(p, port) {
 /// GET a miner's /metrics or /healthz through its proxy URL
 export async function getJson(url, { timeoutMs = 15000 } = {}) {
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), timeoutMs);
-  try { const r = await fetch(url, { signal: ctl.signal }); const txt = await r.text(); try { return JSON.parse(txt); } catch { return { raw: txt.slice(0, 2000), status: r.status }; } } finally { clearTimeout(t); }
+  try { const r = await fetch(url, { signal: ctl.signal }); const txt = await r.text(); try { return JSON.parse(txt); } catch { return { raw: txt.slice(0, 20000), status: r.status }; } } finally { clearTimeout(t); }
 }
 /// kill every miner-*/broker-* pod (a failed run must never keep billing)
 export async function sweep(prefixes = ['miner-', 'broker-']) {
