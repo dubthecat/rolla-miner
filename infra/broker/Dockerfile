@@ -1,4 +1,5 @@
-# ghcr-free: the public Redpanda image, advertising the Fly app's public TCP port (a dedicated IPv4 on 9092).
+# The public Redpanda image (its entrypoint is rpk, so the entrypoint is cleared and redpanda is run directly),
+# advertising the Fly app's public TCP port: a dedicated IPv4 on 9092 (rolla-l3-broker.fly.dev).
 FROM redpandadata/redpanda:latest
-ENV ADVERTISE=rolla-l3-broker.fly.dev
-CMD ["sh", "-c", "exec redpanda start --overprovisioned --smp 1 --memory 700M --reserve-memory 0M --node-id 0 --check=false --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr PLAINTEXT://${ADVERTISE}:9092"]
+ENTRYPOINT []
+CMD ["/usr/bin/redpanda", "start", "--overprovisioned", "--smp", "1", "--memory", "700M", "--reserve-memory", "0M", "--node-id", "0", "--check=false", "--kafka-addr", "PLAINTEXT://0.0.0.0:9092", "--advertise-kafka-addr", "PLAINTEXT://rolla-l3-broker.fly.dev:9092"]
