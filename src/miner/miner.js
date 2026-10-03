@@ -390,6 +390,10 @@ export function createMiner({
         g('resting_orders', s.resting, 'resting orders in the shard');
         g('lag_seconds', s.lagSeconds.toFixed?.(1) ?? s.lagSeconds, 'seconds since the last batch');
         g('verify_ms_per_order', s.perOrderMs, 'milliseconds of signature verification per order');
+        g('verify_ms_total', Math.round(m.verifyMs), 'wall milliseconds spent verifying signatures');
+        g('root_ms_total', Math.round(m.rootMs), 'wall milliseconds spent on Merkle roots and book commitments');
+        g('apply_ms_total', Math.round(m.applyMs), 'wall milliseconds spent replaying ops into the book');
+        g('votes_pending', votesPending.length + votesRetry.length, 'votes not yet in the log');
         g('verify_workers', v.workers, 'signature verification worker threads');
         g('stalled', stalled ? 1 : 0, '1 when the miner stopped applying batches');
         g('final_index', quorum ? quorum.finalIndex : -1, 'the last batch this miner sees as final');

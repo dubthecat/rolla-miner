@@ -44,7 +44,7 @@ async function waitFor(p, pred, label, timeoutMs = 600000) {
 function printCell(name, r) {
   for (const m of Object.values(r.results || {})) say(`  ${name} shard ${m.shard}: ${m.ops} ops · ${m.batches} batches · sequenced ${Math.round(m.ops / m.seqMs * 1000)}/s · finalized ${Math.round(m.ops / m.clusterMs * 1000)}/s · finality p50 ${m.p50} p90 ${m.p90} max ${m.max} ms · seal ${m.perBatchMs} ms (roots ${m.rootMsPerBatch}) · forks ${m.forks}${m.halted ? ' HALTED' : ''}`);
   const a = r.aggregate; if (a) say(`  ${name} AGGREGATE ${a.shards} shards · ${a.totalOps} ops · sequenced ${a.seqRate} orders/s · finalized ${a.finalRate} orders/s (wall ${a.wallFinalMs} ms) · all final ${a.allFinal} · forks ${a.forks} · finality p50 ${a.p50Median} ms (median shard) · p90 ${a.p90Max} ms (max)`);
-  if (r.miners) { const bad = r.miners.filter((m) => !m.ok); say(`  ${name} miners ${r.miners.length} · ${bad.length} unhealthy${bad.length ? ': ' + bad.map((m) => `${m.shard}:${m.stalled || m.error || 'lag'}`).join(' ') : ''}`); }
+  if (r.miners) { const bad = r.miners.filter((m) => !m.ok); say(`  ${name} miners ${r.miners.length} · ${bad.length} unhealthy${bad.length ? ': ' + bad.map((m) => `${m.shard}:${m.stalled || m.error || 'lag'}`).join(' ') : ''}`); for (const m of r.miners.slice(0, 8)) say(`    shard ${m.shard} index ${m.index} · verify ${m.verifyMsPerOrder} ms/order (${m.workers} w) · roots ${m.rootMsPerBatch} ms/batch · replay ${m.applyMsPerBatch} ms/batch · resting ${m.resting}`); }
 }
 try {
   if (MODE === 'cross') {
@@ -71,7 +71,7 @@ try {
     while (Date.now() < deadline) { try { r = await getJson(seqPod.url + '/results'); if (r.done || r.error) break; } catch {} await sleep(5000); }
     if (!r) throw new Error('no results'); if (r.error) say('sequencer host error:', r.error);
     printCell('venue', r);
-    for (const h of hosts) { try { const s = await getJson(h.url + '/healthz'); const lag = s.miners.map((m) => `${m.shard}:${m.index}${m.stalled ? '!' : ''}`).join(' '); say(`${h.name}: ${s.miners.filter((m) => m.ok).length}/${s.count} ok · ${lag}`); } catch (e) { say(h.name, 'health failed', e.message.slice(0, 60)); } }
+    for (const h of hosts) { try { const s = await getJson(h.url + '/healthz'); say(`${h.name}: ${s.miners.filter((m) => m.ok).length}/${s.count} ok`); for (const m of s.miners) say(`    shard ${m.shard} index ${m.index}${m.stalled ? ' STALLED ' + m.stalled : ''} · verify ${m.verifyMsPerOrder} ms/order (${m.workers} workers) · roots ${m.rootMsPerBatch} ms/batch · replay ${m.applyMsPerBatch} ms/batch · resting ${m.resting} · votes pending ${m.votesPending}`); } catch (e) { say(h.name, 'health failed', e.message.slice(0, 60)); } }
     say(`RESULT ${r.done && r.aggregate?.allFinal ? 'ALL SHARDS FINAL' : 'INCOMPLETE'} · sequenced ${r.aggregate?.seqRate} orders/s · finalized ${r.aggregate?.finalRate} orders/s`);
   } else {
     say(`cells: ${CELLS} × (${S} shards × ${R} replicas, ${S * R} miner processes × ${WORKERS} workers, own broker) on ${CELL_VCPU} vCPU · ${N} orders/shard · batches ${BATCH} · epochs ${EPOCH}`);

@@ -24,9 +24,18 @@ export function spawnMiners({ shards, keys, brokers, sequencers, threshold, work
   return miners;
 }
 const get = async (url, ms = 4000) => { const c = new AbortController(); const t = setTimeout(() => c.abort(), ms); try { const r = await fetch(url, { signal: c.signal }); return await r.text(); } finally { clearTimeout(t); } };
-export async function minersHealth(miners) {
+const prom = (txt) => { const o = {}; for (const line of String(txt).split('\n')) { const mm = line.match(/^rolla_l3_([a-z_]+)\{[^}]*\}\s+([-0-9.eE+]+)/); if (mm) o[mm[1]] = Number(mm[2]); } return o; };
+/// each miner's health plus where its time went (from its /metrics): ms per order verifying, ms per batch on roots and replay
+export async function minersHealth(miners, { timing = true } = {}) {
   const out = [];
-  for (const m of miners) { try { const h = JSON.parse(await get(m.url + '/healthz')); out.push({ shard: m.shard, ok: !!h.ok, index: h.index, lagSeconds: h.lagSeconds, stalled: h.stalled, dissents: h.dissents, miner: h.miner }); } catch (e) { out.push({ shard: m.shard, ok: false, error: e.message.slice(0, 60) }); } }
+  for (const m of miners) {
+    try {
+      const h = JSON.parse(await get(m.url + '/healthz'));
+      const row = { shard: m.shard, ok: !!h.ok, index: h.index, lagSeconds: h.lagSeconds, stalled: h.stalled, dissents: h.dissents, miner: h.miner };
+      if (timing) { try { const x = prom(await get(m.url + '/metrics')); const b = x.batches_total || 0; Object.assign(row, { batches: b, orders: x.orders_total, verifyMsPerOrder: x.verify_ms_per_order, rootMsPerBatch: b ? Math.round((x.root_ms_total || 0) / b) : null, applyMsPerBatch: b ? Math.round((x.apply_ms_total || 0) / b) : null, resting: x.resting_orders, votesPending: x.votes_pending, workers: x.verify_workers }); } catch {} }
+      out.push(row);
+    } catch (e) { out.push({ shard: m.shard, ok: false, error: e.message.slice(0, 60) }); }
+  }
   return out;
 }
 export async function minersMetrics(miners) { const parts = []; for (const m of miners) { try { parts.push(await get(m.url + '/metrics')); } catch {} } return parts.join('\n'); }
