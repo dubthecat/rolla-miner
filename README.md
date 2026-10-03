@@ -56,3 +56,7 @@ npm test
 ```
 
 Commits that change the book must keep `native/book/diff.mjs` green: the JavaScript matcher is the specification.
+
+### Broker message limit
+
+Redpanda keeps cluster properties centrally on its volume, so the `--set redpanda.kafka_batch_max_bytes=8388608` in `infra/broker/Dockerfile` only seeds the first boot. The running broker was set with `fly ssh console -a rolla-l3-broker -C "rpk cluster config set kafka_batch_max_bytes 8388608"`; verify with `rpk cluster config get kafka_batch_max_bytes`. An op is ~600 B, so `--batch 2000` is ~1.2 MB per message. The append round trip from a machine outside Fly is ~260 ms whatever the size, and the sequencer seals one batch per round trip: `--batch` is the sequencing-rate knob in this test.

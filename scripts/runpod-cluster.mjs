@@ -31,6 +31,7 @@ import { BOOK_DOMAIN, L3_ORDER_TYPES, l3OrderFor, serializeL3Order } from '../sr
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
 const flag = (k) => process.argv.includes(k);
 const N_MINERS = Number(arg('--miners', 3)), N_ORDERS = Number(arg('--orders', 4000)), VCPU = Number(arg('--vcpu', 2)), FLAVOR = arg('--flavor', 'cpu3c');
+const BATCH = Number(arg('--batch', 250)), EPOCH = Number(arg('--epoch', 10));   // ops per batch (an op is ~600 B; the broker takes 8 MiB per message) · batches per epoch
 const IMAGE = arg('--image', 'ghcr.io/dubthecat/rolla-miner:latest');
 const SHARD = arg('--shard', String(900000 + Math.floor(Math.random() * 99999))), MARKET = Number(SHARD), OUTCOME = 0;
 const BOOK = process.env.PREDICT_BOOK || '0x7197A5160562516F6f8C4503dF03CD836a524D66', CHAIN_ID = Number(process.env.CHAIN_ID || 46630);
@@ -48,7 +49,7 @@ process.on('SIGINT', async () => { await teardown('interrupted'); process.exit(1
 
 try {
   // ---- 1. the broker: Redpanda advertising the public ip:port RunPod hands it ----
-  say(`cluster: ${N_MINERS} miners × ${VCPU} vCPU (${FLAVOR}) · ${N_ORDERS} orders · shard ${SHARD} · threshold ${THRESHOLD}`);
+  say(`cluster: ${N_MINERS} miners × ${VCPU} vCPU (${FLAVOR}) · ${N_ORDERS} orders · batches of ${BATCH}, epochs of ${EPOCH} · shard ${SHARD} · threshold ${THRESHOLD}`);
   // the broker: by default the Fly-hosted Redpanda (infra/broker; a dedicated IPv4 on 9092 — RunPod's public TCP mappings
   // on CPU pods never answered from outside in testing, while its HTTP proxy did), or a broker pod on RunPod with --broker-pod
   let brokers = arg('--brokers', process.env.L3_KAFKA_BROKERS || 'rolla-l3-broker.fly.dev:9092');
@@ -63,6 +64,7 @@ try {
   for (let i = 0; i < 24 && !log; i++) { try { log = await createKafkaLog({ brokers: [brokers], clientId: 'runpod-cluster', logger: () => {} }); } catch (e) { if (i % 4 === 0) say('kafka not ready yet:', e.message.slice(0, 80)); await sleep(5000); } }
   if (!log) throw new Error('could not reach the broker over its public port');
   say('kafka reachable');
+  { const probe = `probe.${SHARD}`, blob = { shard: SHARD, index: 0, blob: 'x'.repeat(150 * 1024) }; await log.append(probe, blob); const t = Date.now(); await log.append(probe, blob); say(`append round trip ${Date.now() - t} ms for 150 KB — the sequencer seals one batch per round trip`); }
 
   // ---- 2. the miners ----
   const seqAcct = privateKeyToAccount(generatePrivateKey());
@@ -81,7 +83,7 @@ try {
   const domain = BOOK_DOMAIN(CHAIN_ID, BOOK);
   const sealedAt = new Map(), finalAt = new Map(); const sealed = [], finals = [], forks = [];
   const state = createShardState({});
-  const seq = createSequencer({ shard: SHARD, log, account: seqAcct, state, batchMs: 60, batchMax: 250, epochBatches: 10, onSealed: (b) => { sealed.push(b); sealedAt.set(b.index, Date.now()); }, logger: () => {} });
+  const seq = createSequencer({ shard: SHARD, log, account: seqAcct, state, batchMs: 60, batchMax: BATCH, epochBatches: EPOCH, onSealed: (b) => { sealed.push(b); sealedAt.set(b.index, Date.now()); }, logger: () => {} });
   await seq.resume();
   const quorum = createQuorum({ threshold: THRESHOLD, onFinal: (f) => { finals.push(f); finalAt.set(f.index, Date.now()); }, onFork: (f) => forks.push(f), logger: () => {} });
   await log.subscribe(ordersTopic(SHARD), 0, async ({ value }) => { quorum.announce(value); });
@@ -113,7 +115,7 @@ try {
     const clusterMs = Date.now() - a;
     const lat = sealed.filter((b) => b.index >= first && b.index <= last).map((b) => (finalAt.get(b.index) || 0) - sealedAt.get(b.index)).filter((x) => x > 0).sort((x, y) => x - y);
     const p = (q) => lat.length ? lat[Math.min(lat.length - 1, Math.floor(q * lat.length))] : null;
-    const sst = seq.status(); if (sst.failed || sst.retry || sst.queued) say('sequencer status', JSON.stringify({ failed: sst.failed, retry: sst.retry, queued: sst.queued, sealed: sst.sealed, batches: sst.batches, perBatchMs: sst.perBatchMs }));
+    const sst = seq.status(); say('sequencer', JSON.stringify({ batches: sst.batches, sealed: sst.sealed, perBatchMs: sst.perBatchMs, rootMsPerBatch: sst.batches ? Number((sst.rootMs / sst.batches).toFixed(1)) : 0, opsPerBatch: sst.batches ? Math.round(sst.ops / sst.batches) : 0, failed: sst.failed, retry: sst.retry, queued: sst.queued }));
     say(`${label}: ${ops.length} ops · batches ${first}..${last} · sequenced in ${seqMs} ms (${Math.round(ops.length / seqMs * 1000)} orders/s) · final at ${quorum.finalIndex} after ${clusterMs} ms (${Math.round(ops.length / clusterMs * 1000)} orders/s cluster) · finality latency seal→quorum p50 ${p(0.5)} ms p90 ${p(0.9)} ms max ${lat[lat.length - 1] ?? null} ms · forks ${forks.length} · halted ${quorum.halted}`);
     return { first, last, final: quorum.finalIndex };
   };
@@ -121,7 +123,7 @@ try {
   const r1 = await run('main run', ops);
   // /metrics is Prometheus text; /healthz is JSON with the index, stall reason and lag
   const prom = (txt) => { const o = {}; for (const line of String(txt).split('\n')) { const mm = line.match(/^rolla_l3_([a-z_]+)\{[^}]*\}\s+([-0-9.eE+]+)/); if (mm) o[mm[1]] = Number(mm[2]); } return o; };
-  const metrics = async () => { for (const m of miners) { try { const h = await getJson(m.url + '/healthz'); const x = prom((await getJson(m.url + '/metrics')).raw || ''); say(m.name, JSON.stringify({ index: h.index, epoch: h.epoch, stalled: h.stalled, lagSeconds: h.lagSeconds, batches: x.batches_total, votes: x.votes_total, dissents: x.dissents_total, badSigs: x.bad_signatures_total, orders: x.orders_total, verifyMs: x.verify_ms_total ?? x.verify_ms, matchMs: x.match_ms_total ?? x.match_ms, rewards: x.rewards_microrolla ?? x.microrolla_total }).slice(0, 320)); } catch (e) { say(m.name, 'metrics failed', e.message.slice(0, 60)); } } };
+  const metrics = async () => { for (const m of miners) { try { const h = await getJson(m.url + '/healthz'); const x = prom((await getJson(m.url + '/metrics')).raw || ''); say(m.name, JSON.stringify({ index: h.index, epoch: h.epoch, stalled: h.stalled, lagSeconds: h.lagSeconds, batches: x.batches_total, votes: x.votes_total, dissents: x.dissents_total, badSigs: x.bad_signatures_total, orders: x.orders_total, verifyMsPerOrder: x.verify_ms_per_order, workers: x.verify_workers, fills: x.fills_total, rewards: x.rewards_credited_micro }).slice(0, 320)); } catch (e) { say(m.name, 'metrics failed', e.message.slice(0, 60)); } } };
   await metrics();
 
   // ---- 5. chaos: one miner dies, the other two keep finalizing ----
