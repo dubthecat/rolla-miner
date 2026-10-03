@@ -5,15 +5,22 @@
   "type": "module",
   "license": "MIT",
   "repository": "github:dubthecat/rolla-miner",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "start": "node src/run.mjs",
-    "test": "node --test src/ && make -C native/book test",
+    "start": "node src/miner/run.mjs",
+    "test": "node --test src/matcher.test.mjs src/native.test.mjs src/miner/verify.test.mjs src/miner/rewards.test.mjs src/miner/miner.test.mjs && make -C native/book test",
     "native": "make -C native/book",
-    "sync": "bash scripts/sync-from-proto.sh"
+    "sync": "bash scripts/sync-from-proto.sh",
+    "cluster": "node scripts/runpod-cluster.mjs"
   },
   "dependencies": {
     "kafkajs": "^2.2.4",
-    "viem": "^2.21.0"
+    "viem": "^2.21.0",
+    "@noble/curves": "^1.6.0",
+    "@noble/hashes": "^1.5.0",
+    "secp256k1": "^5.0.1",
+    "keccak": "^3.0.4"
   }
 }

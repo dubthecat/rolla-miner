@@ -6,6 +6,6 @@ COPY package.json package-lock.json* ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY . .
 RUN make -C native/book libbook.so bookd trace && make -C native/book test >/tmp/native-test.log 2>&1 || (tail -n 20 /tmp/native-test.log; exit 1)
-ENV NODE_ENV=production L3_NATIVE=1 PORT=8080
+ENV NODE_ENV=production PORT=8080 DATA_DIR=/data L3_LOG=kafka
 EXPOSE 8080
-CMD ["node", "src/run.mjs"]
+CMD ["node", "src/miner/run.mjs"]

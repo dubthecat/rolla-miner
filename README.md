@@ -20,17 +20,23 @@ miner builds as a public image and runs anywhere with one command.
 ## Run
 
 ```
-docker run --rm -e L3_LOG=kafka -e L3_KAFKA_BROKERS=broker:9092 -e L3_SHARD=1 -e L3_MINER_KEY=0x… -p 8080:8080 \
+docker run --rm -e L3_LOG=kafka -e L3_KAFKA_BROKERS=broker:9092 -e L3_SHARD=1 -e L3_MINER_KEY=0x… \
+  -e PREDICT_BOOK=0x7197A5160562516F6f8C4503dF03CD836a524D66 -e CHAIN_ID=46630 -p 8080:8080 \
   ghcr.io/dubthecat/rolla-miner:latest
 ```
 
 | env | meaning |
 | --- | --- |
-| `L3_LOG` | `kafka` (default in the image) or `file` (append-only JSONL under `data/`, single node / tests) |
+| `L3_LOG` | `kafka` (default in the image) or `file` (append-only JSONL, single node / tests) |
+| `PREDICT_BOOK` + `CHAIN_ID` | the RollaBook address and chain id: half of the EIP-712 domain the orders were signed under — a wrong value dissents on every batch (checked at boot) |
+| `L3_SEQUENCERS` | addresses allowed to seal batches (empty = any signer, and the miner says so at boot) |
+| `L3_THRESHOLD` | how many agreeing miners this miner considers final (default 2) |
+| `L3_VERIFY_WORKERS` | signature-verification threads (default min(4, cpus−1)); ~3.7k orders/s per worker with the native bindings |
+| `DATA_DIR` | the miner's journal and log copy (`/data` in the image) |
 | `L3_KAFKA_BROKERS` | comma-separated brokers (Redpanda works: see `docker-compose.yml`) |
 | `L3_SHARD` | the market shard this miner follows (topics `orders.<shard>`, `votes.<shard>`) |
 | `L3_MINER_KEY` | the miner's signing key (its votes are EIP-191 signatures; register the address with the validators) |
-| `L3_NATIVE` | `1` = the C++ core in-process (default in the image), `0` = the JavaScript reference |
+| `L3_NATIVE` | `1` = replay in the native book process (tick-grid markets), default the JavaScript reference |
 | `PORT` | `/healthz` and `/metrics` (default 8080) |
 
 Local cluster: `MINER1_KEY=0x… MINER2_KEY=0x… MINER3_KEY=0x… docker compose up` (one Redpanda, three miners).
