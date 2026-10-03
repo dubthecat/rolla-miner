@@ -21,7 +21,16 @@ export async function createPod({ name, image, env = {}, ports = ['8080/http'], 
   const d = await call('POST', '/pods', body);
   return { id: d.id, name, costPerHr: d.costPerHr ?? null };
 }
-export const podInfo = (id) => call('GET', `/pods/${id}`);
+const GQL = 'https://api.runpod.io/graphql';
+/// the REST object plus the GraphQL runtime: REST says what was asked for (desiredStatus), the runtime says what
+/// is actually up (uptime, the public ip:port of every exposed tcp port — assigned only once the container runs)
+export async function podInfo(id) {
+  const rest = await call('GET', `/pods/${id}`);
+  const q = `{ pod(input:{podId:"${id}"}) { id desiredStatus runtime { uptimeInSeconds ports { ip isIpPublic privatePort publicPort type } } } }`;
+  const r = await fetch(GQL, { method: 'POST', headers: { authorization: `Bearer ${key()}`, 'content-type': 'application/json' }, body: JSON.stringify({ query: q }) });
+  const d = await r.json().catch(() => ({})); const rt = d?.data?.pod?.runtime || null;
+  return { ...rest, runtime: rt, uptime: rt?.uptimeInSeconds ?? -1, runtimePorts: rt?.ports || null };
+}
 export const listPods = async () => (await call('GET', '/pods')) || [];
 export async function terminatePod(id) { try { await call('DELETE', `/pods/${id}`); return true; } catch (e) { if (/404|not found/i.test(e.message)) return false; throw e; } }
 
@@ -30,18 +39,19 @@ export async function waitRunning(id, { timeoutMs = 300000, needPorts = [] } = {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     const p = await podInfo(id);
-    const status = p.desiredStatus || p.status; const mappings = p.portMappings || p.runtime?.ports || null;
-    const ready = status === 'RUNNING' && (!needPorts.length || needPorts.every((port) => endpoint({ ...p, portMappings: mappings }, port)));
-    if (ready) return { ...p, portMappings: mappings };
+    const up = p.uptime > 0;   // desiredStatus is RUNNING from the moment the pod is rented; the runtime says when it actually is
+    const ready = up && (!needPorts.length || needPorts.every((port) => { const e = endpoint(p, port); return e && !e.startsWith('https://'); }));
+    if (ready) return p;
     await sleep(5000);
   }
   throw new Error(`pod ${id} not running with its ports after ${timeoutMs / 1000} s`);
 }
 /// the public address of a pod port: ip:port for a tcp mapping, https://<id>-<port>.proxy.runpod.net for http
 export function endpoint(p, port) {
+  const rp = p.runtimePorts || p.runtime?.ports || null;
+  if (Array.isArray(rp)) { const e = rp.find((x) => Number(x.privatePort) === Number(port) && String(x.type || 'tcp').toLowerCase() === 'tcp' && x.isIpPublic !== false && x.ip); if (e) return `${e.ip}:${e.publicPort}`; }
   const m = p.portMappings;
-  if (m && typeof m === 'object') { const pub = m[String(port)] ?? m[port]; if (pub && p.publicIp) return `${p.publicIp}:${pub}`; }
-  if (Array.isArray(m)) { const e = m.find((x) => Number(x.privatePort) === Number(port)); if (e && (e.ip || p.publicIp)) return `${e.ip || p.publicIp}:${e.publicPort}`; }
+  if (m && typeof m === 'object' && !Array.isArray(m)) { const pub = m[String(port)] ?? m[port]; if (pub && p.publicIp) return `${p.publicIp}:${pub}`; }
   return p.id ? `https://${p.id}-${port}.proxy.runpod.net` : null;
 }
 /// GET a miner's /metrics or /healthz through its proxy URL
