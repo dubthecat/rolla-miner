@@ -45,7 +45,7 @@ test: book_test trace bookd
 	@echo "== C++ unit tests"
 	./book_test
 	@echo "== Node unit tests (the reference book and the native client)"
-	cd ../../ && $(NODE) --test engine/l3/matcher.test.mjs engine/l3/native.test.mjs
+	cd ../../ && $(NODE) --test src/matcher.test.mjs src/native.test.mjs
 	@echo "== differential: matcher.js vs the native book, seeds 7 and 11 at 200k ops"
 	$(NODE) diff.mjs
 
