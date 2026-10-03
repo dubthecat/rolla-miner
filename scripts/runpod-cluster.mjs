@@ -97,12 +97,15 @@ try {
     const clusterMs = Date.now() - a;
     const lat = sealed.filter((b) => b.index >= first && b.index <= last).map((b) => (finalAt.get(b.index) || 0) - sealedAt.get(b.index)).filter((x) => x > 0).sort((x, y) => x - y);
     const p = (q) => lat.length ? lat[Math.min(lat.length - 1, Math.floor(q * lat.length))] : null;
+    const sst = seq.status(); if (sst.failed || sst.retry || sst.queued) say('sequencer status', JSON.stringify({ failed: sst.failed, retry: sst.retry, queued: sst.queued, sealed: sst.sealed, batches: sst.batches, perBatchMs: sst.perBatchMs }));
     say(`${label}: ${ops.length} ops · batches ${first}..${last} · sequenced in ${seqMs} ms (${Math.round(ops.length / seqMs * 1000)} orders/s) · final at ${quorum.finalIndex} after ${clusterMs} ms (${Math.round(ops.length / clusterMs * 1000)} orders/s cluster) · finality latency seal→quorum p50 ${p(0.5)} ms p90 ${p(0.9)} ms max ${lat[lat.length - 1] ?? null} ms · forks ${forks.length} · halted ${quorum.halted}`);
     return { first, last, final: quorum.finalIndex };
   };
   say('signing the workload…'); const ops = await workload(N_ORDERS, 11, 0); say('signed', ops.length, 'ops');
   const r1 = await run('main run', ops);
-  const metrics = async () => { for (const m of miners) { try { const x = await getJson(m.url + '/metrics'); say(m.name, JSON.stringify({ index: x.index, epoch: x.epoch, votes: x.votes, dissents: x.dissents, badSigs: x.badSigs, verifyMs: x.verifyMs ?? x.verify?.ms, matchMs: x.matchMs ?? x.match?.ms, rewards: x.rewards ?? x.microRolla, stalled: x.stalled }).slice(0, 300)); } catch (e) { say(m.name, 'metrics failed', e.message.slice(0, 60)); } } };
+  // /metrics is Prometheus text; /healthz is JSON with the index, stall reason and lag
+  const prom = (txt) => { const o = {}; for (const line of String(txt).split('\n')) { const mm = line.match(/^rolla_l3_([a-z_]+)\{[^}]*\}\s+([-0-9.eE+]+)/); if (mm) o[mm[1]] = Number(mm[2]); } return o; };
+  const metrics = async () => { for (const m of miners) { try { const h = await getJson(m.url + '/healthz'); const x = prom((await getJson(m.url + '/metrics')).raw || ''); say(m.name, JSON.stringify({ index: h.index, epoch: h.epoch, stalled: h.stalled, lagSeconds: h.lagSeconds, batches: x.batches_total, votes: x.votes_total, dissents: x.dissents_total, badSigs: x.bad_signatures_total, orders: x.orders_total, verifyMs: x.verify_ms_total ?? x.verify_ms, matchMs: x.match_ms_total ?? x.match_ms, rewards: x.rewards_microrolla ?? x.microrolla_total }).slice(0, 320)); } catch (e) { say(m.name, 'metrics failed', e.message.slice(0, 60)); } } };
   await metrics();
 
   // ---- 5. chaos: one miner dies, the other two keep finalizing ----

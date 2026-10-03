@@ -66,13 +66,14 @@ export function createSequencer({
   const m = { batches: 0, ops: 0, fills: 0, sealed: 0, failed: 0, retried: 0, sealMs: 0, rootMs: 0, lastSealAt: 0 };
   let index = 0, epoch = 0, prevRoot = ZERO32, seqFrom = 1;
   let open = { ops: [], fills: [] };
+  const queued = [];   // full batches (batchMax ops) waiting for their seal, in order — a seal in flight must not let the next batch grow past batchMax
   let timer = null, chain = Promise.resolve(), stopped = false, ready = false;
   const retry = [];
 
   const slotOf = (i) => `${shard}#${i}`;
   /// where an op recorded right now will land. Known before the batch is sealed, which is what lets the engine
   /// stage a fill under its batch the moment it happens.
-  const slot = () => slotOf(index);
+  const slot = () => slotOf(index + queued.length);
 
   function arm() {
     if (timer || stopped) return;
@@ -88,7 +89,7 @@ export function createSequencer({
     if (fills.length) open.fills.push(...fills);
     m.ops++; m.fills += fills.length;
     const here = slot();
-    if (open.ops.length >= batchMax) sealSoon(); else arm();
+    if (open.ops.length >= batchMax) { queued.push(open); open = { ops: [], fills: [] }; sealSoon(); } else arm();
     return here;
   }
   /// apply an op to the sequencer's own book and record it
@@ -103,10 +104,11 @@ export function createSequencer({
   /// the NEXT batch and nothing is ever counted twice or dropped.
   async function seal() {
     if (stopped) return null;
-    if (!open.ops.length && !sealEmpty) return null;
+    if (!queued.length && !open.ops.length && !sealEmpty) return null;
     const t0 = process.hrtime.bigint();
-    const ops = open.ops, fills = open.fills;
-    open = { ops: [], fills: [] };
+    const take = queued.length ? queued.shift() : open;   // oldest full batch first; the open one only when nothing is queued
+    if (take === open) open = { ops: [], fills: [] };
+    const ops = take.ops, fills = take.fills;
     const atEpochEnd = epochBatches > 0 && (index + 1) % epochBatches === 0;
     const t1 = process.hrtime.bigint();
     const ordersRoot = ordersRootOf(ops);
@@ -144,7 +146,7 @@ export function createSequencer({
       try { onEpoch({ ...e, digest: epochDigestOf(e) }, batch); } catch (err) { logFn(`[l3seq] onEpoch failed: ${err.message}`); }
     }
     if (retry.length) drain();
-    if (open.ops.length) arm();
+    if (queued.length) sealSoon(); else if (open.ops.length) arm();
     return batch;
   }
   /// re-append batches the log refused, oldest first; stops at the first failure so the log stays in order
@@ -178,9 +180,9 @@ export function createSequencer({
   return {
     shard: String(shard), topic, state: st, submit, record, seal, resume, slot,
     get index() { return index; }, get epoch() { return epoch; }, get prevRoot() { return prevRoot; },
-    get ready() { return ready; }, get open() { return open.ops.length; },
+    get ready() { return ready; }, get open() { return open.ops.length + queued.reduce((n, b) => n + b.ops.length, 0); },
     async flush() { await sealSoon(); return chain; },
-    status: () => ({ shard: String(shard), index, epoch, prevRoot, open: open.ops.length, retry: retry.length, ready,
+    status: () => ({ shard: String(shard), index, epoch, prevRoot, open: open.ops.length + queued.reduce((n, b) => n + b.ops.length, 0), queued: queued.length, retry: retry.length, ready,
                      batchMs, batchMax, epochBatches, ...m, perBatchMs: m.batches ? Number((m.sealMs / m.batches).toFixed(3)) : 0,
                      state: st.stat ? st.stat() : { seq: st.seq } }),      // the rig's adapter has no books of its own to report
     async stop() { stopped = true; if (timer) { clearTimeout(timer); timer = null; } try { await chain; } catch {} },
