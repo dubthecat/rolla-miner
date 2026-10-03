@@ -45,19 +45,31 @@ try {
   const seqKey = generatePrivateKey(); const seqAddr = privateKeyToAccount(seqKey).address;
   // ---- the miners: one pod per (shard, replica) ----
   const miners = [];
-  for (const shard of SHARDS) for (let r = 0; r < R; r++) {
+  const rent = async (shard, r) => {
     const key = generatePrivateKey();
     const p = await createPodOnLadder({ name: `miner-${shard}-${r + 1}`, image: IMAGE, ports: ['8080/http'], vcpu: VCPU, flavor: FLAVOR, diskGb: 10,
       env: { L3_LOG: 'kafka', L3_KAFKA_BROKERS: BROKERS, L3_SHARD: shard, L3_MINER_KEY: key, PREDICT_BOOK: BOOK, CHAIN_ID: String(CHAIN_ID), L3_SEQUENCERS: seqAddr, L3_THRESHOLD: String(THRESHOLD), L3_VERIFY_WORKERS: String(Math.max(1, VCPU - 1)), PORT: '8080', DATA_DIR: '/data' } });
-    pods.push(p); miners.push({ ...p, shard, replica: r + 1 }); say('pod', p.name, p.id, `${p.cloud} ${p.flavor} × ${p.vcpu}`, `$${p.costPerHr}/h`);
+    pods.push(p); const m = { ...p, shard, replica: r + 1, ok: false }; miners.push(m); say('pod', p.name, p.id, `${p.cloud} ${p.flavor} × ${p.vcpu}`, `$${p.costPerHr}/h`); return m;
+  };
+  for (const shard of SHARDS) for (let r = 0; r < R; r++) await rent(shard, r);
+  const cost = () => miners.filter((m) => !m.dead).reduce((a, p) => a + (p.costPerHr || 0), 0); say(`fleet $${cost().toFixed(2)}/h`);
+  // a pod that never starts (RunPod occasionally rents a host that does not come up) is replaced once; a shard
+  // then needs at least THRESHOLD healthy miners to be counted, otherwise the run stops before spending more
+  const bringUp = async (m, startTimeoutMs) => {
+    const info = await waitRunning(m.id, { timeoutMs: startTimeoutMs }); m.url = endpoint(info, 8080);
+    const deadline = Date.now() + 180000;
+    while (Date.now() < deadline) { try { const h = await getJson(m.url + '/healthz'); if (h && h.miner) { m.ok = true; return; } } catch {} await sleep(4000); }
+    throw new Error('started but never healthy');
+  };
+  for (const m of [...miners]) {
+    try { await bringUp(m, 240000); say(m.name, 'healthy', m.url); }
+    catch (e) {
+      say(m.name, 'did not come up:', e.message.slice(0, 80), '— replacing it'); m.dead = true; try { await terminatePod(m.id); } catch {}
+      try { const n2 = await rent(m.shard, m.replica - 1); await bringUp(n2, 240000); say(n2.name, 'healthy (replacement)', n2.url); }
+      catch (e2) { say(`replacement for ${m.name} failed too: ${e2.message.slice(0, 80)}`); }
+    }
   }
-  const cost = pods.reduce((a, p) => a + (p.costPerHr || 0), 0); say(`fleet $${cost.toFixed(2)}/h`);
-  for (const m of miners) {
-    const info = await waitRunning(m.id, { timeoutMs: 420000 }); m.url = endpoint(info, 8080);
-    const deadline = Date.now() + 240000; let ok = false;
-    while (Date.now() < deadline) { try { const h = await getJson(m.url + '/healthz'); if (h && h.miner) { ok = true; break; } } catch {} await sleep(4000); }
-    say(m.name, ok ? 'healthy' : 'NOT HEALTHY', m.url);
-  }
+  for (const shard of SHARDS) { const up = miners.filter((m) => m.shard === shard && m.ok && !m.dead).length; say(`shard ${shard}: ${up}/${R} miners healthy`); if (up < THRESHOLD) throw new Error(`shard ${shard} has ${up} healthy miner(s), threshold ${THRESHOLD}`); }
   // ---- the shards: a worker thread each; all sign, then all go at once ----
   const dir = path.dirname(fileURLToPath(import.meta.url));
   const workers = SHARDS.map((shard, i) => new Worker(path.join(dir, 'shard-worker.mjs'), { workerData: { shard, brokers: BROKERS, orders: N, batch: BATCH, epoch: EPOCH, threshold: THRESHOLD, seqKey, book: BOOK, chainId: CHAIN_ID, seed: 11 + i } }));
@@ -75,10 +87,10 @@ try {
   const rs = [...results.values()]; const totalOps = rs.reduce((a, r) => a + r.ops, 0);
   const wallSeq = Math.max(...rs.map((r) => r.seqMs)), wallFinal = Math.max(...rs.map((r) => r.clusterMs));
   const allFinal = rs.every((r) => r.finalIndex >= r.last && !r.halted && r.forks === 0);
-  say(`AGGREGATE ${S} shards: ${totalOps} ops · sequenced ${Math.round(totalOps / wallSeq * 1000)} orders/s · finalized ${Math.round(totalOps / wallFinal * 1000)} orders/s across the venue (wall ${wallFinal} ms) · all final ${allFinal} · fleet $${cost.toFixed(2)}/h`);
+  say(`AGGREGATE ${S} shards: ${totalOps} ops · sequenced ${Math.round(totalOps / wallSeq * 1000)} orders/s · finalized ${Math.round(totalOps / wallFinal * 1000)} orders/s across the venue (wall ${wallFinal} ms) · all final ${allFinal} · fleet $${cost().toFixed(2)}/h`);
   // the miners' own counters
   const prom = (txt) => { const o = {}; for (const line of String(txt).split('\n')) { const mm = line.match(/^rolla_l3_([a-z_]+)\{[^}]*\}\s+([-0-9.eE+]+)/); if (mm) o[mm[1]] = Number(mm[2]); } return o; };
-  for (const m of miners) { try { const h = await getJson(m.url + '/healthz'); const x = prom((await getJson(m.url + '/metrics')).raw || ''); say(m.name, JSON.stringify({ index: h.index, stalled: h.stalled, lag: h.lagSeconds, votes: x.votes_total, dissents: x.dissents_total, badSigs: x.bad_signatures_total, orders: x.orders_total, verifyMs: x.verify_ms_per_order, workers: x.verify_workers })); } catch (e) { say(m.name, 'metrics failed', e.message.slice(0, 60)); } }
+  for (const m of miners.filter((x) => x.ok && !x.dead)) { try { const h = await getJson(m.url + '/healthz'); const x = prom((await getJson(m.url + '/metrics')).raw || ''); say(m.name, JSON.stringify({ index: h.index, stalled: h.stalled, lag: h.lagSeconds, votes: x.votes_total, dissents: x.dissents_total, badSigs: x.bad_signatures_total, orders: x.orders_total, verifyMs: x.verify_ms_per_order, workers: x.verify_workers })); } catch (e) { say(m.name, 'metrics failed', e.message.slice(0, 60)); } }
   say(`RESULT ${allFinal ? 'ALL SHARDS FINAL' : 'INCOMPLETE'} · ${rs.reduce((a, r) => a + r.batches, 0)} batches · ${rs.reduce((a, r) => a + r.forks, 0)} forks`);
 } catch (e) { say('FAILED', e.stack || e.message); process.exitCode = 1; }
 finally { await teardown(); }

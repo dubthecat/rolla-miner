@@ -136,7 +136,7 @@ export function createMiner({
   if (dir) { fs.mkdirSync(dir, { recursive: true }); jBatches = path.join(dir, `${shard}.batches.jsonl`); jVotes = path.join(dir, `${shard}.votes.jsonl`); }
   const append = (file, rec) => { if (file) try { fs.appendFileSync(file, JSON.stringify(rec) + '\n'); } catch (e) { logFn(`[l3miner] journal append failed: ${e.message}`); } };
 
-  const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0 };
+  const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0, voteFailures: 0, voteRetried: 0 };
   let index = -1, epoch = 0, prevRoot = ZERO32, offset = -1, stalled = null, subOrders = null, subVotes = null, started = false, stopping = false;
   let lastVote = null, lastBookHash = ZERO32, inflight = Promise.resolve();
   const recent = new Map();                            // index → { batch, fills }, for challenge proofs
@@ -224,15 +224,51 @@ export function createMiner({
       recent.set(mine.index, { batch, fills });
       if (recent.size > keepFills) { const oldest = Math.min(...recent.keys()); recent.delete(oldest); }
       lastVote = vote;
-      await log.append(votes, vote);
-      quorum && quorum.announce(batch);
-      onBatch && onBatch({ batch, vote, fills, ok });
-      onVote && onVote(vote);
+      // the vote joins the append pipeline: the next batch is verified while this vote is in flight (a vote
+      // used to cost one log round trip per batch — on RunPod the miners fell 12 s behind a sequencer they
+      // could verify 10× faster than it fed them, with the broker 100–300 ms away)
+      queueVote(vote, () => {
+        quorum && quorum.announce(batch);
+        onBatch && onBatch({ batch, vote, fills, ok });
+        onVote && onVote(vote);
+      });
     } catch (e) {
       m.errors++; logFn(`[l3miner] batch ${batch?.index} failed: ${e.message}`);
       stalled = `batch ${batch?.index}: ${e.message}`;
     }
   }
+  // ------------------------------------------------------------- the vote pipeline
+  /// votes go out in index order, as many per produce request as are waiting; a refusing log keeps them (in
+  /// order) and retries — the miner keeps verifying meanwhile, and its health says votes are waiting
+  const votesPending = [], votesRetry = []; let votePump = null, voteRetryTimer = null;
+  function queueVote(vote, after) { votesPending.push({ vote, after }); pumpVotes(); }
+  function pumpVotes() {
+    if (!votePump) votePump = (async () => { try { await pumpVotesLoop(); } catch (e) { logFn(`[l3miner] vote pipeline: ${e.message}`); } finally { votePump = null; if (votesPending.length) pumpVotes(); } })();
+    return votePump;
+  }
+  async function sendVotes(group) {
+    if (group.length > 1 && typeof log.appendMany === 'function') await log.appendMany(votes, group.map((g) => g.vote));
+    else for (const g of group) await log.append(votes, g.vote);
+  }
+  async function pumpVotesLoop() {
+    while (votesPending.length) {
+      if (votesRetry.length) await drainVotes();
+      const group = votesPending.splice(0, 500);
+      if (votesRetry.length) { votesRetry.push(...group); m.voteFailures += group.length; continue; }   // still refusing: wait behind the earlier ones
+      try { await sendVotes(group); for (const g of group) runAfter(g); }
+      catch (e) { votesRetry.push(...group); m.voteFailures += group.length; logFn(`[l3miner] ${group.length} vote(s) could not be logged (${e.message}); ${votesRetry.length} waiting`); armVoteRetry(); }
+    }
+  }
+  async function drainVotes() {
+    while (votesRetry.length) {
+      const g = votesRetry[0];
+      try { await log.append(votes, g.vote); votesRetry.shift(); m.voteRetried++; runAfter(g); } catch { armVoteRetry(); return; }
+    }
+  }
+  function armVoteRetry() { if (voteRetryTimer || stopping) return; voteRetryTimer = setTimeout(() => { voteRetryTimer = null; pumpVotes(); }, 1000); voteRetryTimer.unref?.(); }
+  const runAfter = (g) => { try { g.after && g.after(); } catch (e) { logFn(`[l3miner] after-vote hook failed: ${e.message}`); } };
+  const votesSettled = async () => { while (votesPending.length || votePump) await (votePump || pumpVotes()); };
+
   /// handlers are serialised: the log may deliver quickly, but a book is a state machine and two batches must
   /// never be in flight at once
   const serial = (fn) => (rec) => (inflight = inflight.then(() => fn(rec)).catch((e) => { m.errors++; logFn(`[l3miner] ${e.message}`); }));
@@ -291,6 +327,8 @@ export function createMiner({
   async function stop() {
     stopping = true;
     try { await inflight; } catch {}
+    try { await votesSettled(); } catch {}
+    if (voteRetryTimer) { clearTimeout(voteRetryTimer); voteRetryTimer = null; }
     try { subOrders && subOrders.close && (await subOrders.close()); } catch {}
     try { subVotes && subVotes.close && (await subVotes.close()); } catch {}
     if (ownVerifier) { try { await v.close(); } catch {} }
@@ -300,12 +338,12 @@ export function createMiner({
 
   // ------------------------------------------------------------- views
   const lagSeconds = () => (m.lastAt ? (Date.now() - m.lastAt) / 1000 : -1);
-  const healthy = () => !stalled && m.dissents === 0 && (m.lastAt === 0 || lagSeconds() * 1000 < staleMs * 20);
+  const healthy = () => !stalled && m.dissents === 0 && votesRetry.length === 0 && (m.lastAt === 0 || lagSeconds() * 1000 < staleMs * 20);
   function status() {
     return {
       shard: String(shard), miner: account.address, log: log.kind, index, epoch, offset, stalled,
       resting: state.size, bookHash: lastBookHash, prevRoot,
-      lagSeconds: lagSeconds(), workers: v.workers, ...m,
+      lagSeconds: lagSeconds(), workers: v.workers, votesPending: votesPending.length + votesRetry.length, ...m,
       perOrderMs: m.orders ? Number((m.verifyMs / m.orders).toFixed(3)) : 0,
       lastVote: lastVote ? { index: lastVote.index, ok: lastVote.ok, fillsRoot: lastVote.fillsRoot, batchRoot: lastVote.batchRoot } : null,
       quorum: quorum ? quorum.status() : null,
