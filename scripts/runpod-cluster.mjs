@@ -26,6 +26,12 @@ import { createSequencer } from '../src/miner/sequencer.js';
 import { createShardState } from '../src/miner/miner.js';
 import { createQuorum } from '../src/miner/quorum.js';
 import { orderHash } from '../src/miner/verify.js';
+import { createRequire } from 'node:module';
+let SECP = null; try { SECP = createRequire(import.meta.url)('secp256k1'); if (typeof SECP.ecdsaSign !== 'function') SECP = null; } catch {}
+const h2b = (h) => Uint8Array.from(Buffer.from(h.slice(2), 'hex'));
+/// libsecp256k1 signing (RFC 6979, low S): byte-identical to viem's signTypedData at ~50 µs instead of ~2 ms, so a
+/// 100k-order workload signs in seconds; the first few signatures are checked against viem every run
+const fastSign = (keyHex, digestHex) => { const { signature, recid } = SECP.ecdsaSign(h2b(digestHex), h2b(keyHex)); return '0x' + Buffer.from(signature).toString('hex') + (27 + recid).toString(16).padStart(2, '0'); };
 import { BOOK_DOMAIN, L3_ORDER_TYPES, l3OrderFor, serializeL3Order } from '../src/desk.js';
 
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
@@ -91,19 +97,25 @@ try {
 
   // ---- 4. the workload: matcher.test.mjs's shape, signed by eight traders ----
   const E = 10n ** 18n; const token = '0x' + 'c0'.repeat(20);
-  const traders = Array.from({ length: 8 }, () => privateKeyToAccount(generatePrivateKey()));
+  const traders = Array.from({ length: 8 }, () => { const key = generatePrivateKey(); return { key, acct: privateKeyToAccount(key) }; });
   async function workload(n, seed, offset) {
     let s = seed >>> 0; const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296; const live = [], plan = [];
     for (let i = 0; i < n; i++) {
       if (live.length && rnd() < 0.1) { plan.push({ t: 'cancel', target: live.splice(Math.floor(rnd() * live.length), 1)[0] }); continue; }
       const buy = rnd() < 0.5, cross = rnd() < 0.3, mid = 50, off = Math.floor(rnd() * 20);
       const cents = buy ? (cross ? mid + off : mid - 1 - off) : (cross ? mid - off : mid + 1 + off);
-      const acct = traders[Math.floor(rnd() * traders.length)];
-      const order = l3OrderFor({ user: acct.address, marketId: MARKET, outcome: OUTCOME, token, buy, price: BigInt(cents) * E / 100n, size: BigInt(1 + Math.floor(rnd() * 100)) * E, ioc: rnd() < 0.1 });
+      const tr = traders[Math.floor(rnd() * traders.length)];
+      const order = l3OrderFor({ user: tr.acct.address, marketId: MARKET, outcome: OUTCOME, token, buy, price: BigInt(cents) * E / 100n, size: BigInt(1 + Math.floor(rnd() * 100)) * E, ioc: rnd() < 0.1 });
       order.nonce = BigInt(1700000000000 + offset + i); order.salt = BigInt(offset + i) * 7919n + 1n;
-      plan.push({ t: 'add', acct, order }); if (!order.ioc) live.push(plan.length - 1);
+      plan.push({ t: 'add', acct: tr.acct, key: tr.key, order }); if (!order.ioc) live.push(plan.length - 1);
     }
-    for (const p of plan) if (p.t === 'add') { const order = serializeL3Order(p.order); const sig = await p.acct.signTypedData({ domain, types: L3_ORDER_TYPES, primaryType: 'L3Order', message: p.order }); p.op = { t: 'add', hash: orderHash(domain, order), market: MARKET, outcome: OUTCOME, order, sig, signer: p.acct.address.toLowerCase(), at: Date.now() }; }
+    let checked = 0;
+    for (const p of plan) if (p.t === 'add') {
+      const order = serializeL3Order(p.order); const hash = orderHash(domain, order); let sig;
+      if (SECP) { sig = fastSign(p.key, hash); if (checked++ < 3) { const ref = await p.acct.signTypedData({ domain, types: L3_ORDER_TYPES, primaryType: 'L3Order', message: p.order }); if (ref !== sig) throw new Error('fast signer disagrees with viem'); } }
+      else sig = await p.acct.signTypedData({ domain, types: L3_ORDER_TYPES, primaryType: 'L3Order', message: p.order });
+      p.op = { t: 'add', hash, market: MARKET, outcome: OUTCOME, order, sig, signer: p.acct.address.toLowerCase(), at: Date.now() };
+    }
     for (const p of plan) if (p.t === 'cancel') p.op = { t: 'cancel', hash: plan[p.target].op.hash, market: MARKET, outcome: OUTCOME };
     return plan.map((p) => p.op);
   }
@@ -119,7 +131,7 @@ try {
     say(`${label}: ${ops.length} ops · batches ${first}..${last} · sequenced in ${seqMs} ms (${Math.round(ops.length / seqMs * 1000)} orders/s) · final at ${quorum.finalIndex} after ${clusterMs} ms (${Math.round(ops.length / clusterMs * 1000)} orders/s cluster) · finality latency seal→quorum p50 ${p(0.5)} ms p90 ${p(0.9)} ms max ${lat[lat.length - 1] ?? null} ms · forks ${forks.length} · halted ${quorum.halted}`);
     return { first, last, final: quorum.finalIndex };
   };
-  say('signing the workload…'); const ops = await workload(N_ORDERS, 11, 0); say('signed', ops.length, 'ops');
+  say('signing the workload…', SECP ? '(libsecp256k1)' : '(viem)'); const tSign = Date.now(); const ops = await workload(N_ORDERS, 11, 0); say('signed', ops.length, 'ops in', Date.now() - tSign, 'ms');
   const r1 = await run('main run', ops);
   // /metrics is Prometheus text; /healthz is JSON with the index, stall reason and lag
   const prom = (txt) => { const o = {}; for (const line of String(txt).split('\n')) { const mm = line.match(/^rolla_l3_([a-z_]+)\{[^}]*\}\s+([-0-9.eE+]+)/); if (mm) o[mm[1]] = Number(mm[2]); } return o; };
