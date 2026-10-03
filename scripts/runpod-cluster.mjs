@@ -7,11 +7,11 @@ import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { createPod, waitRunning, endpoint, terminatePod, getJson, podInfo } from './runpod.mjs';
 const FLAVORS = ['cpu3c', 'cpu5c', 'cpu3g', 'cpu5g', 'cpu3m', 'cpu5m'];
 /// RunPod says 500 "Something went wrong" when a flavor has no instance with that many vCPUs: walk the flavors, then halve the vCPUs
-async function createPodOnLadder(opts, say) {
+async function createPodOnLadder(opts) {
   let lastErr = null;
   for (const vcpu of [opts.vcpu, Math.max(2, Math.floor(opts.vcpu / 2))]) for (const flavor of [opts.flavor, ...FLAVORS.filter((f) => f !== opts.flavor)]) {
     try { const p = await createPod({ ...opts, vcpu, flavor }); return { ...p, vcpu, flavor }; }
-    catch (e) { lastErr = e; say(`no pod on ${flavor} × ${vcpu} vCPU: ${e.message.slice(0, 90)}`); }
+    catch (e) { lastErr = e; console.log(`  no pod on ${flavor} × ${vcpu} vCPU: ${e.message.slice(0, 90)}`); }
   }
   throw lastErr;
 }
