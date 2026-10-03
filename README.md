@@ -43,7 +43,7 @@ Local cluster: `MINER1_KEY=0x… MINER2_KEY=0x… MINER3_KEY=0x… docker compos
 
 ## RunPod
 
-The image is public; a miner is a CPU pod. `scripts/runpod-cluster.mjs` (RunPod API key in `RUNPOD_API_KEY`) starts one
+The image is public; a miner is a CPU pod. The log broker runs on Fly (`infra/broker`: Redpanda behind a dedicated IPv4 on 9092, `rolla-l3-broker.fly.dev:9092`) because RunPod's public TCP mappings on CPU pods did not answer from outside in testing while its HTTP proxy did; miners only need outbound connections. `scripts/runpod-cluster.mjs` (RunPod API key in `RUNPOD_API_KEY`) starts one
 Redpanda pod and N miner pods, feeds a workload, collects every miner's `/metrics` (log offset, finalized epoch, votes,
 dissents, orders/s, signature cost) and terminates everything. Budget-capped.
 

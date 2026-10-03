@@ -1,0 +1,24 @@
+# fly deploy -c infra/broker/fly.toml  (from the repo root) — the L3 log broker for miner clusters (Redpanda, Kafka API)
+# One-time: fly apps create rolla-l3-broker · fly volumes create rpdata -a rolla-l3-broker --region ams --size 3 · fly ips allocate-v4 -a rolla-l3-broker
+app = "rolla-l3-broker"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[services]]
+  internal_port = 9092
+  protocol = "tcp"
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+  [[services.ports]]
+    port = 9092
+
+[mounts]
+  source = "rpdata"
+  destination = "/var/lib/redpanda/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

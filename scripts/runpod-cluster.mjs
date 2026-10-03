@@ -33,11 +33,16 @@ process.on('SIGINT', async () => { await teardown('interrupted'); process.exit(1
 try {
   // ---- 1. the broker: Redpanda advertising the public ip:port RunPod hands it ----
   say(`cluster: ${N_MINERS} miners × ${VCPU} vCPU (${FLAVOR}) · ${N_ORDERS} orders · shard ${SHARD} · threshold ${THRESHOLD}`);
-  const broker = await createPod({ name: `broker-${SHARD}`, image: 'redpandadata/redpanda:latest', ports: ['9092/tcp'], vcpu: 2, flavor: FLAVOR, diskGb: 10, entrypoint: ['sh', '-c'],
-    cmd: ['exec redpanda start --overprovisioned --smp 1 --memory 1G --reserve-memory 0M --node-id 0 --check=false --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr PLAINTEXT://$RUNPOD_PUBLIC_IP:$RUNPOD_TCP_PORT_9092'] });
-  pods.push(broker); say('broker pod', broker.id, `$${broker.costPerHr}/h`);
-  const bp = await waitRunning(broker.id, { needPorts: [9092], timeoutMs: 420000 });
-  const brokers = endpoint(bp, 9092); say('broker running at', brokers, 'public ip', bp.publicIp);
+  // the broker: by default the Fly-hosted Redpanda (infra/broker; a dedicated IPv4 on 9092 — RunPod's public TCP mappings
+  // on CPU pods never answered from outside in testing, while its HTTP proxy did), or a broker pod on RunPod with --broker-pod
+  let brokers = arg('--brokers', process.env.L3_KAFKA_BROKERS || 'rolla-l3-broker.fly.dev:9092');
+  if (flag('--broker-pod')) {
+    const broker = await createPod({ name: `broker-${SHARD}`, image: 'redpandadata/redpanda:latest', ports: ['9092/tcp'], vcpu: 2, flavor: FLAVOR, diskGb: 10, entrypoint: ['sh', '-c'],
+      cmd: ['exec redpanda start --overprovisioned --smp 1 --memory 1G --reserve-memory 0M --node-id 0 --check=false --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr PLAINTEXT://$RUNPOD_PUBLIC_IP:$RUNPOD_TCP_PORT_9092'] });
+    pods.push(broker); say('broker pod', broker.id, `$${broker.costPerHr}/h`);
+    const bp = await waitRunning(broker.id, { needPorts: [9092], timeoutMs: 420000 });
+    brokers = endpoint(bp, 9092); say('broker running at', brokers, 'public ip', bp.publicIp);
+  } else say('broker', brokers);
   let log = null;
   for (let i = 0; i < 24 && !log; i++) { try { log = await createKafkaLog({ brokers: [brokers], clientId: 'runpod-cluster', logger: () => {} }); } catch (e) { if (i % 4 === 0) say('kafka not ready yet:', e.message.slice(0, 80)); await sleep(5000); } }
   if (!log) throw new Error('could not reach the broker over its public port');
