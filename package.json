@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node src/miner/run.mjs",
-    "test": "node --test src/matcher.test.mjs src/native.test.mjs src/miner/verify.test.mjs src/miner/rewards.test.mjs src/miner/miner.test.mjs && make -C native/book test",
+    "test": "node --test src/matcher.test.mjs src/native.test.mjs src/miner/verify.test.mjs src/miner/sequencer.test.mjs src/miner/rewards.test.mjs src/miner/miner.test.mjs && make -C native/book test",
     "native": "make -C native/book",
     "sync": "bash scripts/sync-from-proto.sh",
     "cluster": "node scripts/runpod-cluster.mjs"

@@ -82,6 +82,16 @@ export function createSequencer({
   }
   const sealSoon = () => { chain = chain.then(() => seal()).catch((e) => { m.failed++; logFn(`[l3seq] seal failed: ${e.message}`); }); return chain; };
 
+  /// a full batch closes NOW: its seq range and, at an epoch end, its book commitment are taken from the state as it
+  /// is at this moment — later ops keep being applied to the state while this batch waits for its seal, and a hash
+  /// taken at seal time would describe a book the batch's own ops never produced (the miners dissented on exactly
+  /// the epoch-boundary batches when a remote log made batches queue up)
+  function closeOpen() {
+    const idx = index + queued.length;
+    open.seqTo = st.seq;
+    if (epochBatches > 0 && (idx + 1) % epochBatches === 0) open.bookHash = st.bookHash();
+    queued.push(open); open = { ops: [], fills: [] };
+  }
   /// record an op the caller has already applied to the shard's book
   function record(op, fills = []) {
     if (stopped) return null;
@@ -89,7 +99,7 @@ export function createSequencer({
     if (fills.length) open.fills.push(...fills);
     m.ops++; m.fills += fills.length;
     const here = slot();
-    if (open.ops.length >= batchMax) { queued.push(open); open = { ops: [], fills: [] }; sealSoon(); } else arm();
+    if (open.ops.length >= batchMax) { closeOpen(); sealSoon(); } else arm();
     return here;
   }
   /// apply an op to the sequencer's own book and record it
@@ -107,17 +117,17 @@ export function createSequencer({
     if (!queued.length && !open.ops.length && !sealEmpty) return null;
     const t0 = process.hrtime.bigint();
     const take = queued.length ? queued.shift() : open;   // oldest full batch first; the open one only when nothing is queued
-    if (take === open) open = { ops: [], fills: [] };
+    if (take === open) { open = { ops: [], fills: [] }; take.seqTo = st.seq; }
     const ops = take.ops, fills = take.fills;
     const atEpochEnd = epochBatches > 0 && (index + 1) % epochBatches === 0;
     const t1 = process.hrtime.bigint();
     const ordersRoot = ordersRootOf(ops);
     const fillsRoot = fillsRootOf(fills);
-    const bookHash = atEpochEnd ? st.bookHash() : ZERO32;
+    const bookHash = atEpochEnd ? (take.bookHash || st.bookHash()) : ZERO32;
     m.rootMs += Number(process.hrtime.bigint() - t1) / 1e6;
     const rw = atEpochEnd && rewardsRoot ? (rewardsRoot() || null) : null;
     const batch = {
-      shard: String(shard), epoch, index, seqFrom, seqTo: st.seq,
+      shard: String(shard), epoch, index, seqFrom, seqTo: take.seqTo,
       prevRoot, ordersRoot, fillsRoot, bookHash,
       rewardsRoot: rw?.root || ZERO32, rewardsEpoch: rw && rw.epoch >= 0 ? rw.epoch : -1,
       ops, at: Date.now(), sequencer: account.address, batchRoot: ZERO32, sig: '0x',
@@ -126,7 +136,7 @@ export function createSequencer({
     // advance the chain BEFORE awaiting anything: the next batch's prevRoot is this one's root, whatever
     // happens to the append
     const thisIndex = index, thisEpoch = epoch;
-    prevRoot = batch.batchRoot; index++; seqFrom = st.seq + 1;
+    prevRoot = batch.batchRoot; index++; seqFrom = take.seqTo + 1;
     if (atEpochEnd) epoch++;
     batch.sig = await signDigest(account, batch.batchRoot);
     try {
