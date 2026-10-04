@@ -247,13 +247,19 @@ export function createSequencer({
  *   status()                                 for /v1/l3/status
  *   stop()
  *
- * Finality arrives through `onFinal({ slot, index, shard, batch, votes })`, and a fork through `onFork(f)`.
- * One sequencer and one quorum per shard; a shard is one market by default (L3_SHARD_BY=outcome gives a shard
- * per book instead, for a market hot enough to deserve it).
+ * Finality arrives through `onFinal({ slot, index, shard, batch, votes, finalSigs })`, and a fork through
+ * `onFork(f)`. One sequencer and one quorum per shard; a shard is one market by default (L3_SHARD_BY=outcome
+ * gives a shard per book instead, for a market hot enough to deserve it).
+ *
+ * `resumeFrom(shard)` → index | null (async allowed): after a restart, the first batch index whose finality the
+ * caller still needs — the engine answers with the oldest batch it still has fills staged under, and, settling
+ * from roots, the chain's own `nextIndex` (docs/L3-MINERS.md §4). The rig re-announces the log's batches from
+ * there and replays the votes, so those batches finalize again instead of the quorum waiting forever for index 0.
+ * Without it the quorum starts at the log's tail: nothing before the restart is finalized again.
  */
 export function createSequencerRig({
   env = process.env, dir = null, account = null, logger: logFn = console.log,
-  onFinal = null, onFork = null, onEpoch = null, newBook = null,
+  onFinal = null, onFork = null, onEpoch = null, newBook = null, resumeFrom = null,
 } = {}) {
   const acct = account || (env.OPERATOR_KEY ? privateKeyToAccount(env.OPERATOR_KEY.startsWith('0x') ? env.OPERATOR_KEY : '0x' + env.OPERATOR_KEY) : null);
   if (!acct) throw new Error('the L3 sequencer needs OPERATOR_KEY');
@@ -291,7 +297,7 @@ export function createSequencerRig({
           const e = ++s0.closedEpoch; const rec = rewards.closeEpoch(e); stats.epochsClosed++;
           logFn(`[l3rig] ${shard} epoch ${e} rewards closed: ${rec.miners} miner(s), ${rec.total} µROLLA, root ${rec.rewardsRoot.slice(0, 12)}…`);
         }
-        onFinal && onFinal({ slot: `${shard}#${f.index}`, shard, index: f.index, epoch: f.epoch, fills: f.fills, batch: f.batch, batchRoot: f.batchRoot, votes: f.votes, miners: f.miners, credit: f.credit });
+        onFinal && onFinal({ slot: `${shard}#${f.index}`, shard, index: f.index, epoch: f.epoch, fills: f.fills, batch: f.batch, batchRoot: f.batchRoot, votes: f.votes, miners: f.miners, finalSigs: f.finalSigs || [], credit: f.credit });
       },
       onFork: (f) => { stats.forks++; onFork && onFork({ shard, ...f }); },
     });
@@ -339,6 +345,16 @@ export function createSequencerRig({
     s.ready = (async () => {
       const impl = await ready();
       await seq.resume();
+      // where finality resumes: the log's tail unless the caller still needs earlier batches (see resumeFrom)
+      let from = seq.index;
+      if (resumeFrom) { try { const r = await resumeFrom(shard); if (r != null && Number.isFinite(Number(r))) from = Math.max(0, Math.min(from, Number(r))); } catch (e) { logFn(`[l3rig] resumeFrom(${shard}) failed: ${e.message}`); } }
+      quorum.start(from);
+      if (from < seq.index) {
+        // offsets and indices coincide for a single-sequencer shard (one append per batch — see resume())
+        const rows = await impl.read(seq.topic, from, seq.index - from);
+        let n = 0; for (const { value } of rows) if (value && String(value.shard) === String(shard) && Number(value.index) >= from) { quorum.announce(value); n++; }
+        logFn(`[l3rig] ${shard}: re-announced ${n} batch(es) from index ${from} (log at ${seq.index}) for finality after restart`);
+      }
       s.sub = await impl.subscribe(votesTopic(shard), 0, async ({ value }) => { try { await quorum.vote(value); } catch (e) { logFn(`[l3rig] vote rejected: ${e.message}`); } });
       return s;
     })().catch((e) => { logFn(`[l3rig] shard ${shard} not ready: ${e.message}`); return s; });
@@ -382,6 +398,8 @@ export function createSequencerRig({
     /// force a seal on every shard (used by tests and by a graceful shutdown)
     async flush() { for (const s of shards.values()) await s.seq.flush(); },
     shard(shard) { return shards.get(shard) || null; },
+    /// the sorted finality signatures a finalized batch has now (quorum.js finalSigsOf), or null
+    finalSigsOf(shard, index) { const s = shards.get(String(shard)); return s ? s.quorum.finalSigsOf(index) : null; },
     status() {
       const out = { log: logImpl ? logImpl.kind : 'starting', dir: logImpl?.dir || null, threshold, ...stats, shards: {} };
       for (const [k, s] of shards) out.shards[k] = { sequencer: s.seq.status(), quorum: s.quorum.status(), rewardsEpochClosed: s.closedEpoch };

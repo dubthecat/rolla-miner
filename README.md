@@ -34,12 +34,25 @@ docker run --rm -e L3_LOG=kafka -e L3_KAFKA_BROKERS=broker:9092 -e L3_SHARD=1 -e
 | `L3_VERIFY_WORKERS` | signature-verification threads (default min(4, cpus−1)); ~3.7k orders/s per worker with the native bindings |
 | `DATA_DIR` | the miner's journal and log copy (`/data` in the image) |
 | `L3_KAFKA_BROKERS` | comma-separated brokers (Redpanda works: see `docker-compose.yml`) |
-| `L3_SHARD` | the market shard this miner follows (topics `orders.<shard>`, `votes.<shard>`) |
+| `L3_SHARD` | ONE market shard this miner follows (topics `orders.<shard>`, `votes.<shard>`) — or, without it, fleet mode: |
+| `L3_SHARDS` | a comma-separated list of shards, every one mined by this process (one log connection, one verifier, a miner per shard, one `/healthz`) |
+| `L3_ENGINE_URL` | follow the engine: `GET <url>/v1/l3/markets` every `L3_MARKETS_POLL_MS` (60000) lists its books; a miner starts for every shard that appears and stops for one that disappears (`L3_SHARDS` entries never stop). `L3_SHARD_BY=outcome` mirrors an engine that shards by book |
+| `L3_LOG_RETRY_MS` | fleet mode: the wait between attempts to reach the broker at boot (5000); `/healthz` is 503 meanwhile, not a crash loop |
 | `L3_MINER_KEY` | the miner's signing key (its votes are EIP-191 signatures; register the address with the validators) |
 | `L3_NATIVE` | `1` = replay in the native book process (tick-grid markets), default the JavaScript reference |
 | `PORT` | `/healthz` and `/metrics` (default 8080) |
 
 Local cluster: `MINER1_KEY=0x… MINER2_KEY=0x… MINER3_KEY=0x… docker compose up` (one Redpanda, three miners).
+
+## Fly fleet (production)
+
+Three always-on miners — `rollmarkets-miner-1/2/3` in `ams`, one app and one shared-cpu-2x / 1 GB machine each, the
+three keys registered on `RollaL3Miners` `0x4a95…1fe0` (threshold 2) — run this image in **fleet mode** from
+`infra/miner/fly.toml`: they follow `https://rollmarkets.com/v1/l3/markets` every minute and mine every listed shard off
+the Fly broker, sign `L3Final` for `RollaBookL3`, and answer `/healthz` + `/metrics` at `https://rollmarkets-miner-N.fly.dev/`.
+`infra/miner/deploy.sh N` creates and deploys one (idempotent; the key is read from `~/.rollacoasta-keys/l3-miner-N.key`
+and never printed), `infra/miner/status.sh` prints the three health lines, `infra/miner/RUNBOOK.md` has the rest:
+rolling the image, rotating a key, re-staking, the staged test, the engine flip. About $6.55 a month per miner.
 
 ## RunPod
 

@@ -153,3 +153,57 @@ export const l3CancelMessage = (hash, ts) => `RollMarkets L3 cancel ${hash} ${ts
 export const l3CancelAllMessage = (ts) => `RollMarkets L3 cancel-all ${ts}`;
 export async function signL3CancelWithSession(sessionPk, hash, ts) { return privateKeyToAccount(sessionPk).signMessage({ message: l3CancelMessage(hash, ts) }); }
 export async function signL3CancelAllWithSession(sessionPk, ts) { return privateKeyToAccount(sessionPk).signMessage({ message: l3CancelAllMessage(ts) }); }
+
+// ---- miner finality (RollaBookL3.sol, docs/L3-MINERS.md §4) ----------------------------------------
+// RollaBookL3 is RollaBook plus two functions. `attest(L3Final, sigs)` records a batch root once `threshold`
+// distinct staked miners (RollaL3Miners) signed the EIP-712 `L3Final` below — same domain as the orders
+// (`RollaBook`/`1`, verifyingContract = the RollaBookL3 address), signatures sorted by signer ascending, in chain
+// order per shard. `settleFromRoot(shardId, index, RootFill[])` then settles fills with everything `settle`
+// checks AND a Merkle proof per fill against the finalized fillsRoot (engine/l3/miner/merkle.js's tree),
+// consuming the leaf. shardId = keccak256(utf8(shard)) (merkle.js shardId()).
+export const L3_FINAL_TYPES = {
+  L3Final: [
+    { name: 'shardId', type: 'bytes32' }, { name: 'index', type: 'uint64' }, { name: 'batchRoot', type: 'bytes32' },
+    { name: 'prevRoot', type: 'bytes32' }, { name: 'fillsRoot', type: 'bytes32' }, { name: 'fills', type: 'uint32' },
+  ],
+};
+const L3_FINAL_TUPLE = { type: 'tuple', components: [
+  { name: 'shardId', type: 'bytes32' }, { name: 'index', type: 'uint64' }, { name: 'batchRoot', type: 'bytes32' },
+  { name: 'prevRoot', type: 'bytes32' }, { name: 'fillsRoot', type: 'bytes32' }, { name: 'fills', type: 'uint32' },
+] };
+const L3_FILL_TUPLE = { type: 'tuple', components: [{ name: 'maker', ...L3_ORDER_TUPLE }, { name: 'taker', ...L3_ORDER_TUPLE }, { name: 'price', type: 'uint256' }, { name: 'size', type: 'uint256' }] };
+const L3_PROOF_TUPLE = { type: 'tuple', components: [{ name: 'seq', type: 'uint64' }, { name: 'index', type: 'uint32' }, { name: 'path', type: 'bytes32[]' }] };
+export const BOOK_L3_ABI = [
+  ...BOOK_ABI,
+  { type: 'function', name: 'attest', stateMutability: 'nonpayable', inputs: [{ name: 'a', ...L3_FINAL_TUPLE }, { name: 'sigs', type: 'bytes[]' }], outputs: [] },
+  { type: 'function', name: 'settleFromRoot', stateMutability: 'nonpayable', inputs: [{ name: 'shardId', type: 'bytes32' }, { name: 'index', type: 'uint64' }, { name: 'items', type: 'tuple[]', components: [{ name: 'fill', ...L3_FILL_TUPLE }, { name: 'proof', ...L3_PROOF_TUPLE }, { name: 'makerSig', type: 'bytes' }, { name: 'takerSig', type: 'bytes' }] }], outputs: [] },
+  { type: 'function', name: 'finalDigest', stateMutability: 'view', inputs: [{ name: 'a', ...L3_FINAL_TUPLE }], outputs: [{ type: 'bytes32' }] },
+  { type: 'function', name: 'finals', stateMutability: 'view', inputs: [{ type: 'bytes32' }, { type: 'uint64' }], outputs: [{ name: 'batchRoot', type: 'bytes32' }, { name: 'prevRoot', type: 'bytes32' }, { name: 'fillsRoot', type: 'bytes32' }, { name: 'fills', type: 'uint32' }, { name: 'attestedAt', type: 'uint64' }] },
+  { type: 'function', name: 'anchored', stateMutability: 'view', inputs: [{ type: 'bytes32' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'nextIndex', stateMutability: 'view', inputs: [{ type: 'bytes32' }], outputs: [{ type: 'uint64' }] },
+  { type: 'function', name: 'lastRoot', stateMutability: 'view', inputs: [{ type: 'bytes32' }], outputs: [{ type: 'bytes32' }] },
+  { type: 'function', name: 'isSettled', stateMutability: 'view', inputs: [{ type: 'bytes32' }, { type: 'uint64' }, { type: 'uint32' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'fillLeaf', stateMutability: 'pure', inputs: [{ type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'address' }, { type: 'address' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }], outputs: [{ type: 'bytes32' }] },
+  { type: 'function', name: 'verifyFillProof', stateMutability: 'pure', inputs: [{ type: 'bytes32' }, { type: 'uint32' }, { type: 'uint32' }, { type: 'bytes32[]' }, { type: 'bytes32' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'miners', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { type: 'function', name: 'FINAL_TYPEHASH', stateMutability: 'view', inputs: [], outputs: [{ type: 'bytes32' }] },
+  { type: 'event', name: 'Attested', inputs: [{ name: 'shardId', type: 'bytes32', indexed: true }, { name: 'index', type: 'uint64', indexed: true }, { name: 'batchRoot', type: 'bytes32', indexed: false }, { name: 'fillsRoot', type: 'bytes32', indexed: false }, { name: 'fills', type: 'uint32', indexed: false }, { name: 'signers', type: 'uint256', indexed: false }] },
+  { type: 'event', name: 'SettledFromRoot', inputs: [{ name: 'shardId', type: 'bytes32', indexed: true }, { name: 'index', type: 'uint64', indexed: true }, { name: 'fills', type: 'uint256', indexed: false }, { name: 'moves', type: 'uint256', indexed: false }] },
+];
+/// the staked miner set (RollaL3Miners.sol): what the engine reads before it attests
+export const L3_MINERS_ABI = [
+  { type: 'function', name: 'threshold', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'minStake', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'isMiner', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'stakeOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'allMiners', stateMutability: 'view', inputs: [], outputs: [{ type: 'address[]' }] },
+  { type: 'function', name: 'minerCount', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'register', stateMutability: 'payable', inputs: [], outputs: [] },
+];
+/// the L3Final message as the contract hashes it: index as a bigint (uint64), fills as a number (uint32)
+export const l3FinalMessage = (a) => ({ shardId: a.shardId, index: BigInt(a.index), batchRoot: a.batchRoot, prevRoot: a.prevRoot, fillsRoot: a.fillsRoot, fills: Number(a.fills) });
+/// a miner's finality signature over a batch: EIP-712 L3Final under BOOK_DOMAIN(chainId, bookL3). Equals
+/// RollaBookL3.finalDigest(a) signed — pinned against the deployed contract in engine/l3/l3-root.test.mjs.
+export async function signL3Final(account, domain, a) {
+  return account.signTypedData({ domain, types: L3_FINAL_TYPES, primaryType: 'L3Final', message: l3FinalMessage(a) });
+}

@@ -29,8 +29,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { createBook } from '../matcher.js';
-import { parseL3Order, BOOK_DOMAIN } from '../desk.js';
-import { fillsRootOf, ordersRootOf, batchRootOf, voteDigestOf, merkleProof, fillLeaf, ZERO32 } from './merkle.js';
+import { parseL3Order, BOOK_DOMAIN, signL3Final } from '../desk.js';
+import { fillsRootOf, ordersRootOf, batchRootOf, voteDigestOf, merkleProof, fillLeaf, shardId, ZERO32 } from './merkle.js';
 import { createVerifier, recoverDigestSigner, signDigest } from './verify.js';
 import { createQuorum } from './quorum.js';
 import { rewardsFromEnv } from './rewards.js';
@@ -123,12 +123,17 @@ export async function bookFactory({ env = process.env, dir = null, logger = null
  *   watchVotes  also track every miner's votes (its own included), so the miner knows what is final — and what
  *               it has earned in µROLLA (rewards.js) — without asking the engine or the operator
  *   commit      the epoch book commitment: 'bookhash' | 'tree' or createCommitState's options (default L3_COMMIT)
+ *   bookL3      the RollaBookL3 address (default PREDICT_BOOK_L3 / L3_BOOK_L3). With it, every `ok` vote also carries
+ *               `finalSig`: the EIP-712 `L3Final(shardId, index, batchRoot, prevRoot, fillsRoot, fills)` under
+ *               BOOK_DOMAIN(domain.chainId, bookL3) — exactly RollaBookL3.finalDigest — which is what the engine
+ *               brings on chain in attest() (docs/L3-MINERS.md §4, L3_SETTLE=root). Unset: votes carry no finality
+ *               signature, and the batch can be final off chain but never attested.
  *   tamper      TEST HOOK: (batch, fills) => fills — a Byzantine miner. Never set in production.
  */
 export function createMiner({
   shard, log, account, domain = null, dir = null, newBook = null, verifier = null, workers = null,
   sequencers = null, grantOf = null, watchVotes = true, threshold = 2, staleMs = 30000, commit = null,
-  tamper = null, onBatch = null, onVote = null, logger: logFn = console.log, env = process.env,
+  bookL3 = null, tamper = null, onBatch = null, onVote = null, logger: logFn = console.log, env = process.env,
 } = {}) {
   if (!shard) throw new Error('a miner needs a shard');
   if (!log) throw new Error('a miner needs a log');
@@ -136,6 +141,10 @@ export function createMiner({
   const address = lower(account.address);
   const dom = domain || BOOK_DOMAIN(Number(env.CHAIN_ID || 46630), env.PREDICT_BOOK || '0x' + '00'.repeat(20));
   const allowSeq = sequencers ? new Set([...sequencers].map(lower)) : null;
+  // the finality domain: the same EIP-712 domain shape as the orders, on the RollaBookL3 address
+  const finalBook = (() => { const b = bookL3 || env.PREDICT_BOOK_L3 || env.L3_BOOK_L3 || ''; return /^0x[0-9a-fA-F]{40}$/.test(b) ? b : null; })();
+  const finalDomain = finalBook ? BOOK_DOMAIN(Number(dom.chainId), finalBook) : null;
+  const sid = shardId(shard);
   let make = newBook || (() => createBook());          // replaced by the native factory in start() when asked
   const newState = () => createShardState({ newBook: make, logger: logFn, commit, env });
   let state = newState();
@@ -227,6 +236,12 @@ export function createMiner({
         fills: fills.length, ops: ops.length, ok, why, at: Date.now(), miner: address, sig: '0x',
       };
       vote.sig = await signDigest(account, voteDigestOf(vote));
+      // finality on chain: an agreeing miner also signs the L3Final RollaBookL3.attest verifies. The fields it covers
+      // travel with the vote, so a reader can check the signature without the batch. A dissent signs nothing.
+      if (ok && finalDomain) {
+        vote.final = { book: finalBook, chainId: Number(dom.chainId), shardId: sid, index: mine.index, batchRoot: myRoot, prevRoot: mine.prevRoot, fillsRoot, fills: fills.length };
+        vote.finalSig = await signL3Final(account, finalDomain, vote.final);
+      }
 
       index = mine.index; prevRoot = batch.batchRoot || myRoot; epoch = mine.epoch; offset = off;
       if (bookHash !== ZERO32) lastBookHash = bookHash;
@@ -333,7 +348,7 @@ export function createMiner({
       logFn(`[l3miner] ${shard}: replayed ${r.replayed} batch(es) from the journal → index ${index}, ${state.size} resting, book ${lastBookHash.slice(0, 12)}…`);
     }
     const from = offset + 1;
-    logFn(`[l3miner] up · shard ${shard} · miner ${account.address} · log ${log.kind} · ${v.workers} verify worker(s) · commitment ${state.commit.mode}${state.commit.tree ? ' (' + state.commit.impl + ')' : ''} · from offset ${from}`);
+    logFn(`[l3miner] up · shard ${shard} · miner ${account.address} · log ${log.kind} · ${v.workers} verify worker(s) · commitment ${state.commit.mode}${state.commit.tree ? ' (' + state.commit.impl + ')' : ''} · finality ${finalBook ? 'signed for ' + finalBook : 'NOT signed (no PREDICT_BOOK_L3)'} · from offset ${from}`);
     subOrders = await log.subscribe(orders, from, serial(handleBatch));
     // its OWN votes go in too: the agreeing set is what earns, so a miner that skipped itself could not account
     // for its own µROLLA (rewards.js), and the quorum keys votes by miner so re-reading one is harmless
@@ -358,7 +373,7 @@ export function createMiner({
   function status() {
     return {
       shard: String(shard), miner: account.address, log: log.kind, index, epoch, offset, stalled,
-      resting: state.size, bookHash: lastBookHash, prevRoot,
+      resting: state.size, bookHash: lastBookHash, prevRoot, finalBook,
       lagSeconds: lagSeconds(), workers: v.workers, votesPending: votesPending.length + votesRetry.length, ...m,
       perOrderMs: m.orders ? Number((m.verifyMs / m.orders).toFixed(3)) : 0,
       lastVote: lastVote ? { index: lastVote.index, ok: lastVote.ok, fillsRoot: lastVote.fillsRoot, batchRoot: lastVote.batchRoot } : null,
@@ -433,7 +448,7 @@ export function createMiner({
     return server;
   }
 
-  const api = { shard: String(shard), address: account.address, start, stop, status, serve, proveFill, state, quorum, rewards, verifier: v,
+  const api = { shard: String(shard), address: account.address, start, stop, status, serve, proveFill, state, quorum, rewards, verifier: v, finalBook,
                 get index() { return index; }, get epoch() { return epoch; }, get bookHash() { return lastBookHash; }, get stalled() { return stalled; },
                 get lastVote() { return lastVote; }, metrics: () => ({ ...m }) };
   return api;

@@ -122,6 +122,15 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
   /// how many fills the agreeing miners say that batch produced. They agree on fillsRoot, so they agree on this;
   /// the batch itself does not carry it (a batch carries no fills, by design), so the votes are where it lives.
   function fillsOf(s) { for (const m of s.agree) { const v = s.votes.get(m); if (v && Number.isFinite(Number(v.fills))) return Number(v.fills); } return 0; }
+  /// the agreeing miners' finality signatures (miner.js signs the EIP-712 L3Final with an `ok` vote when it knows the
+  /// RollaBookL3 address), sorted by signer address ascending — the order RollaBookL3.attest requires, which is also
+  /// how it proves they are distinct. A miner that voted without one is simply absent here; the engine checks the
+  /// count against the on-chain threshold before it attests, and asks again later when more votes have arrived.
+  function finalSigsOf(s) {
+    const out = [];
+    for (const m of s.agree) { const v = s.votes.get(m); if (v && typeof v.finalSig === 'string' && /^0x[0-9a-fA-F]{130}$/.test(v.finalSig)) out.push({ miner: m, sig: v.finalSig, final: v.final || null }); }
+    return out.sort((a, b) => (a.miner < b.miner ? -1 : a.miner > b.miner ? 1 : 0));
+  }
 
   /// advance finality through contiguous finalized batches, firing onFinal in order
   function settleFinality() {
@@ -135,7 +144,7 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
       // the batch is final: every miner that agreed earns its µROLLA for it (rewards.js). Paying only the agreeing
       // set is the whole incentive — a miner that did not replay, or replayed differently, is not paid for it.
       const credit = rewards ? rewards.creditBatch({ epoch, index: next.index, fills, miners: [...next.agree] }) : null;
-      try { onFinal && onFinal({ index: next.index, epoch, fills, batch: next.batch, batchRoot: next.root, votes: next.agree.size, miners: [...next.agree], credit }); }
+      try { onFinal && onFinal({ index: next.index, epoch, fills, batch: next.batch, batchRoot: next.root, votes: next.agree.size, miners: [...next.agree], finalSigs: finalSigsOf(next), credit }); }
       catch (e) { logger && logger(`[l3quorum] onFinal failed at ${next.index}: ${e.message}`); }
     }
   }
@@ -145,6 +154,13 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     get finalIndex() { return finalIndex; },
     get head() { return head; },
     get halted() { return halted; },
+    /// the sorted finality signatures a batch has NOW (more may have arrived since onFinal fired), with the fill
+    /// count the agreeing miners signed; null until the batch is known
+    finalSigsOf(index) { const s = batches.get(Number(index)); return s ? { index: s.index, root: s.root, final: s.final, fills: fillsOf(s), sigs: finalSigsOf(s) } : null; },
+    /// resume finality at `from` (the first index this quorum is expected to finalize): a restarted rig re-announces
+    /// the batches from there and replays the votes, and the chain continues instead of waiting forever for batches
+    /// nobody will announce again. Only before anything was announced; a quorum that already runs keeps its state.
+    start(from) { if (batches.size || finalIndex >= 0) return finalIndex; const f = Math.max(0, Number(from) || 0); finalIndex = f - 1; return finalIndex; },
     /// a batch's standing, for /v1/l3/status and the miner's /metrics
     at(index) { const s = batches.get(Number(index)); return s ? { index: s.index, root: s.root, final: s.final, agree: [...s.agree], dissent: [...s.dissent.keys()], votes: s.votes.size } : null; },
     forks: () => forks.slice(-32),
