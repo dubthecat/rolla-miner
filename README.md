@@ -37,7 +37,7 @@ docker run --rm -e L3_LOG=kafka -e L3_KAFKA_BROKERS=broker:9092 -e L3_SHARD=1 -e
 | `L3_SHARD` | ONE market shard this miner follows (topics `orders.<shard>`, `votes.<shard>`) — or, without it, fleet mode: |
 | `L3_SHARDS` | a comma-separated list of shards, every one mined by this process (one log connection, one verifier, a miner per shard, one `/healthz`) |
 | `L3_ENGINE_URL` | follow the engine: `GET <url>/v1/l3/markets` every `L3_MARKETS_POLL_MS` (60000) lists its books; a miner starts for every shard that appears and stops for one that disappears (`L3_SHARDS` entries never stop). `L3_SHARD_BY=outcome` mirrors an engine that shards by book |
-| `L3_LOG_RETRY_MS` | fleet mode: the wait between attempts to reach the broker at boot (5000); `/healthz` is 503 meanwhile, not a crash loop |
+| `L3_LOG_BOOT_RETRY_MS` | fleet mode: the wait between attempts to reach the broker at boot (5000); `/healthz` is 503 meanwhile, not a crash loop |
 | `L3_MINER_KEY` | the miner's signing key (its votes are EIP-191 signatures; register the address with the validators) |
 | `L3_NATIVE` | `1` = replay in the native book process (tick-grid markets), default the JavaScript reference |
 | `PORT` | `/healthz` and `/metrics` (default 8080) |

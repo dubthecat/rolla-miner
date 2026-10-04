@@ -40,7 +40,7 @@
 //                     buffered updates that force a flush before the batch ends (default 4000)
 //   RPC / RPC2        optional: with PREDICT_DESK_V2, session-key grants are checked on chain instead of trusted
 //   PORT              /healthz and /metrics (default 8090)
-//   L3_LOG_RETRY_MS   fleet mode: how long to wait between attempts to reach the log at boot (default 5000; the
+//   L3_LOG_BOOT_RETRY_MS  fleet mode: the wait between attempts to reach the log at boot (default 5000; the
 //                     health endpoint answers 503 meanwhile, so a broker that is down shows as such, not as a crash loop)
 //   --once            replay what is in the log, print one status line, exit 0 if healthy
 import fs from 'node:fs';
@@ -183,7 +183,7 @@ const mainFleet = async () => {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('unhandledRejection', (e) => log('error', 'unhandledRejection', { err: e?.message || String(e) }));
 
-  const retryMs = Number(env.L3_LOG_RETRY_MS || 5000);
+  const retryMs = Number(env.L3_LOG_BOOT_RETRY_MS || 5000);   // not L3_LOG_RETRY_MS: that is the sequencer's failed-connect memory
   for (let attempt = 1; !theLog && !stopping; attempt++) {
     try { theLog = await createLog({ env, dir: env.L3_LOG_DIR || path.join(dataDir, 'l3', 'log'), clientId: `rolla-miner-fleet-${process.pid}`, logger: (m) => log('info', m) }); }
     catch (e) {
