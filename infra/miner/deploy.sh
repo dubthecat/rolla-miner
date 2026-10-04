@@ -37,4 +37,11 @@ fly secrets set -a "$APP" --stage L3_MINER_KEY="$(tr -d '[:space:]' < "$KEY")" >
 # 4. deploy: the template config, this app, the image, the book address; --ha=false = exactly one machine
 fly deploy --config "$HERE/fly.toml" --app "$APP" --image "$IMAGE" --ha=false \
   --env PREDICT_BOOK="$BOOK_L3" --env PREDICT_BOOK_L3="$BOOK_L3"
+
+# 5. public addresses for /healthz (a shared IPv4 and a dedicated IPv6, both free). The first deploy tries to allocate
+# them itself and, under an org token, fails the IPv6 half ("org_slug is only supported with private_v6 type") — so
+# they are made here, idempotently, and the app is reachable at https://$APP.fly.dev either way.
+ips=$(fly ips list -a "$APP" 2>/dev/null || true)
+echo "$ips" | grep -q "v4" || fly ips allocate-v4 --shared -a "$APP" >/dev/null
+echo "$ips" | grep -q "v6" || fly ips allocate-v6 -a "$APP" >/dev/null
 echo "deployed $APP · https://$APP.fly.dev/healthz"

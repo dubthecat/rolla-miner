@@ -98,8 +98,11 @@ FLEET_SET_SHARDS=1 node scripts/predict/l3-e2e.mjs --fleet
 ```
 
 `L3_SEQUENCERS` is widened because the local runtime seals batches with the deployer key, not the engine operator's.
-Without `FLEET_SET_SHARDS=1` the script prints the two `fly secrets` lines and waits for the shard to appear on the
-miners' `/healthz` before it trades. Either way check `bash infra/miner/status.sh` afterwards: three healthy miners, no
+Without `FLEET_SET_SHARDS=1` the script prints the three `fly secrets set` lines and goes on; the batch waits in the log
+until the miners come back with the shard (run the lines within the script's ten-minute settlement wait). Run on
+2026-10-04 against this fleet: market #15377, attest tx `0xeccb9304e4d71fa4d60c352c903bbcfe3afaca1fa88dd081612846e2047eb00f`
+(3 miner signatures), settleFromRoot tx `0x4384acb09020153d1827fa6aa879bff3cf41653d660955dd3151809a880e18b7`, every miner
+at `index 3 · votes 4 · dissents 0 · finalIndex 3` on the shard afterwards. Either way check `bash infra/miner/status.sh` afterwards: three healthy miners, no
 `L3_SHARDS` left (`fly secrets list -a rollmarkets-miner-N`).
 
 ## The engine flip (a later, coordinated step)
