@@ -208,17 +208,20 @@ export function createSequencer({
   /// resume from the log: the last batch there fixes index, epoch and prevRoot, so a restarted sequencer
   /// continues the same chain instead of forking it. Offsets and indices coincide for a single-sequencer shard
   /// (one append per batch), which is why a miner can subscribe at `index + 1`.
-  async function resume() {
-    const n = await log.offset(topic);
-    if (n > 0) {
-      const tail = await log.read(topic, Math.max(0, n - 1), 1);
-      const last = tail.length ? tail[tail.length - 1].value : null;
-      if (last && String(last.shard) === String(shard)) {
-        // an epoch-boundary batch (the one carrying a book commitment) closes its epoch
-        index = Number(last.index) + 1; prevRoot = last.batchRoot; seqFrom = Number(last.seqTo) + 1;
-        epoch = Number(last.epoch) + (last.bookHash && last.bookHash !== ZERO32 ? 1 : 0);
-        logFn(`[l3seq] ${shard}: resuming at index ${index}, epoch ${epoch}, prevRoot ${prevRoot.slice(0, 12)}…`);
-      }
+  /// `known`: the log's last record when the caller has already read the log (the rig replays the whole shard
+  /// before resuming — see createSequencerRig's reconcile); undefined reads the tail here, null is an empty log
+  async function resume(known = undefined) {
+    let last = known;
+    if (last === undefined) {
+      last = null;
+      const n = await log.offset(topic);
+      if (n > 0) { const tail = await log.read(topic, Math.max(0, n - 1), 1); last = tail.length ? tail[tail.length - 1].value : null; }
+    }
+    if (last && String(last.shard) === String(shard)) {
+      // an epoch-boundary batch (the one carrying a book commitment) closes its epoch
+      index = Number(last.index) + 1; prevRoot = last.batchRoot; seqFrom = Number(last.seqTo) + 1;
+      epoch = Number(last.epoch) + (last.bookHash && last.bookHash !== ZERO32 ? 1 : 0);
+      logFn(`[l3seq] ${shard}: resuming at index ${index}, epoch ${epoch}, prevRoot ${prevRoot.slice(0, 12)}…`);
     }
     ready = true;
     return { index, epoch, prevRoot };
@@ -256,10 +259,17 @@ export function createSequencer({
  * from roots, the chain's own `nextIndex` (docs/L3-MINERS.md §4). The rig re-announces the log's batches from
  * there and replays the votes, so those batches finalize again instead of the quorum waiting forever for index 0.
  * Without it the quorum starts at the log's tail: nothing before the restart is finalized again.
+ *
+ * `booksOf()` → every engine book ({ key, market, outcome, m }), `recOf(hash)` → the engine's order record ({ hash,
+ * o, sig, signer, at }) and `swapBook(book, matcher)` are what the boot-time RECONCILE needs (see reconcile() below):
+ * the engine's books of a shard are compared with the log's own replay, whatever the log never got is sequenced,
+ * and the engine's matchers are replaced by the log's so the sequence counters agree with every miner's. Without
+ * booksOf only the books the rig has seen are reconciled; without swapBook the matchers are kept (native books).
  */
 export function createSequencerRig({
   env = process.env, dir = null, account = null, logger: logFn = console.log,
   onFinal = null, onFork = null, onEpoch = null, newBook = null, resumeFrom = null,
+  booksOf = null, recOf = null, swapBook = null,
 } = {}) {
   const acct = account || (env.OPERATOR_KEY ? privateKeyToAccount(env.OPERATOR_KEY.startsWith('0x') ? env.OPERATOR_KEY : '0x' + env.OPERATOR_KEY) : null);
   if (!acct) throw new Error('the L3 sequencer needs OPERATOR_KEY');
@@ -270,16 +280,110 @@ export function createSequencerRig({
   const batchMs = Number(env.L3_BATCH_MS || 60), batchMax = Number(env.L3_BATCH_MAX || 500), epochBatches = Number(env.L3_EPOCH_BATCHES || 20);
   const shardOf = (market, outcome) => (byOutcome ? `${Number(market)}-${Number(outcome)}` : String(Number(market)));
 
-  const shards = new Map();     // shard → { seq, quorum, sub, books, state, rewards, closedEpoch }
+  const shards = new Map();     // shard → { seq, quorum, sub, books, state, rewards, closedEpoch, deferred, reconcile }
   let logImpl = null, started = null, stopping = false;
-  const stats = { finalized: 0, forks: 0, records: 0, skipped: 0, epochsClosed: 0 };
+  const stats = { finalized: 0, forks: 0, records: 0, skipped: 0, deferred: 0, reconciled: 0, unreconciled: 0, rebuilt: 0, epochsClosed: 0 };
+  const PAGE = Math.max(1, Number(env.L3_RECONCILE_PAGE || 1000));
+
+  /// the log's view of a shard: every batch replayed through the same state machine a miner runs (miner.js's
+  /// createShardState, bookhash mode — the resting SET and the sequence counters are what matter here). What the
+  /// miners hold is exactly this, so it is what the engine's books have to be reconciled with before anything
+  /// new is sequenced. Paged, so a long shard does not need its whole log in memory at once.
+  async function replayLog(impl, topic, shard) {
+    const state = createShardState({ commit: 'bookhash', env, logger: logFn });
+    const n = await impl.offset(topic);
+    let last = null, batches = 0, ops = 0, bad = 0;
+    for (let from = 0; from < n; from += PAGE) {
+      const rows = await impl.read(topic, from, Math.min(PAGE, n - from));
+      for (const { value } of rows) {
+        if (!value || String(value.shard) !== String(shard)) continue;
+        for (const op of value.ops || []) { try { state.apply(op); ops++; } catch { bad++; } }
+        last = value; batches++;
+      }
+    }
+    if (bad) logFn(`[l3rig] ${shard}: ${bad} op(s) in the log could not be replayed`);
+    return { state, last, batches, ops, n };
+  }
+  /// the same resting orders, with the same remaining sizes
+  function sameResting(a, b) {
+    if (a.length !== b.length) return false;
+    const m = new Map(a.map((o) => [lower(o.hash), BigInt(o.remaining)]));
+    for (const o of b) { const r = m.get(lower(o.hash)); if (r === undefined || r !== BigInt(o.remaining)) return false; }
+    return true;
+  }
+  /**
+   * reconcile the engine's books of a shard with the log, at the shard's boot and before anything new is sequenced.
+   *
+   * The engine's book is rebuilt from its own journal at a restart; the miners' from the log. The two diverge
+   * whenever the engine applied an op the log never got: a cancel recorded within batchMs of the process exiting
+   * (the market maker's shutdown cancel-all, 2026-10-07: the batch timer never fired), an order the replay expired,
+   * an op applied while the shard's log was still being resumed (deferred below), or — the other way — an add
+   * whose batch was sealed but never appended. The epoch commitment then differs for good, and since the matcher's
+   * sequence counter (part of every resting leaf AND every fill leaf) advances on cancels too, so would every
+   * later fill's root: the fleet dissented on every epoch boundary of four shards after the deploys of 10-07.
+   *
+   * So: (1) an order the log holds that the engine no longer does is cancelled in the log (`by: 'reconcile'`) —
+   * first, so that nothing the engine already dropped is still resting when (2) an order resting here that the log
+   * never got is re-sequenced (an untouched one only — a partly filled order cannot be replayed; and a post-only
+   * order re-sequenced over a stale orphan would be refused as crossing: the live dry run of 18104 showed it);
+   * (3) the ops deferred during the resume follow, in their order; (4) the engine's matchers are REPLACED by the
+   * log's replay plus those ops — the same resting orders, the miners' sequence numbers — and the commitment is
+   * re-seeded from them. A book that still differs afterwards keeps its matcher and is reported: the shard will
+   * dissent at epoch boundaries until that order leaves the book.
+   */
+  function reconcile(s, shadow) {
+    const engineBooks = (booksOf ? booksOf() : [...s.books]).filter((b) => b && b.m && shardOf(b.market, b.outcome) === s.shard);
+    for (const b of engineBooks) s.state.track(b);       // every book of the shard is in the commitment, resting since before this boot included
+    const out = { at: Date.now(), logBatches: shadow.batches, logOps: shadow.ops, deferred: s.deferred.length, cancelled: 0, resequenced: 0, unreconciled: 0, rebuilt: 0, kept: 0, books: engineBooks.length };
+    // the deferred ops are in the engine's book already and will be sequenced below (step 3): what they added is
+    // not "unlogged", what they cancelled is not "orphaned". The shadow gets every op in the order the miners will.
+    const deferredAdds = new Set(), deferredCancels = new Set();
+    for (const d of s.deferred) (d.op.t === 'cancel' ? deferredCancels : deferredAdds).add(lower(d.op.hash));
+    const mine = new Map(); for (const b of engineBooks) for (const o of b.m.orders()) mine.set(lower(o.hash), { o, b });
+    const theirs = new Map(); for (const [key, sb] of shadow.state.books) { const [market, outcome] = key.split(':').map(Number); for (const o of sb.orders()) theirs.set(lower(o.hash), { o, market, outcome }); }
+    const sequence = (op, fills = []) => { s.state.ops++; stats.records++; try { shadow.state.apply(op); } catch {} return s.seq.record(op, fills); };
+    for (const { o, market, outcome } of theirs.values()) if (!mine.has(lower(o.hash)) && !deferredCancels.has(lower(o.hash))) { out.cancelled++; sequence({ t: 'cancel', hash: o.hash, market, outcome, user: lower(o.user), by: 'reconcile', at: Date.now() }); }
+    const unlogged = [...mine.values()].filter(({ o }) => !theirs.has(lower(o.hash)) && !deferredAdds.has(lower(o.hash))).sort((a, b) => Number(a.o.seq) - Number(b.o.seq));
+    for (const { o, b } of unlogged) {
+      const rec = recOf ? recOf(o.hash) : null;
+      if (rec && rec.o && rec.sig && BigInt(o.remaining) === BigInt(rec.o.size)) { out.resequenced++; sequence({ t: 'add', hash: rec.hash, market: Number(b.market), outcome: Number(b.outcome), order: serializeL3Order(rec.o), sig: rec.sig, signer: lower(rec.signer || rec.o.user), at: rec.at || Date.now() }); }
+      else { out.unreconciled++; logFn(`[l3rig] ${s.shard}: resting order ${String(o.hash).slice(0, 12)}… is not in the log and cannot be re-sequenced (${rec ? 'partly filled' : 'no record'}); the miners will not hold it`); }
+    }
+    for (const d of s.deferred.splice(0)) sequence(d.op, d.fills);
+    if (swapBook) for (const b of engineBooks) {
+      const sb = shadow.state.books.get(`${Number(b.market)}:${Number(b.outcome)}`);
+      if (!sb) continue;                                   // the log never saw this book: nothing to take the counter from
+      if (!sameResting(b.m.orders(), sb.orders())) { out.kept++; logFn(`[l3rig] ${s.shard}: book ${b.key || `${b.market}:${b.outcome}`} still differs from the log after the reconcile; its matcher is kept`); continue; }
+      const old = b.m.orders();
+      swapBook(b, sb);
+      for (const o of old) s.state.commit.cancelled(o.hash);   // the tree's leaves carry sequence numbers: re-seed (bookhash mode walks the books)
+      s.state.commit.seed(b.m.orders());
+      out.rebuilt++;
+    }
+    s.reconcile = out;
+    stats.deferred += out.deferred; stats.reconciled += out.cancelled + out.resequenced; stats.unreconciled += out.unreconciled; stats.rebuilt += out.rebuilt;
+    if (out.cancelled || out.resequenced || out.unreconciled || out.deferred || out.kept) logFn(`[l3rig] ${s.shard}: reconciled with the log (${shadow.batches} batch(es), ${shadow.ops} op(s)): ${out.cancelled} cancel(s) the log never got, ${out.resequenced} order(s) re-sequenced, ${out.deferred} op(s) deferred during the resume, ${out.unreconciled} not reconcilable, ${out.rebuilt} book(s) now numbered as the log${out.kept ? `, ${out.kept} kept` : ''}`);
+    return out;
+  }
+  // the log down (a broker unreachable at boot, or gone): the first attempt pays kafkajs's bounded connect retry,
+  // every call in the next L3_LOG_RETRY_MS fails at once with the same reason — an order never waits on a dead
+  // broker twice — and a shard whose boot failed is re-armed on its next prepare() once that window has passed.
+  // The engine keeps running either way: fills simply settle as they do without miners (null slots).
+  const retryMs = Number(env.L3_LOG_RETRY_MS || 30000);
+  const logDown = { at: 0, error: null, attempts: 0 };
 
   async function boot() {
+    logDown.attempts++;
     logImpl = await createLog({ env, dir: logDir, clientId: `rolla-seq-${process.pid}`, logger: logFn });
     logFn(`[l3rig] sequencing into ${logImpl.kind} log${logImpl.dir ? ' at ' + logImpl.dir : ''} · threshold ${threshold}${allow.length ? ` · ${allow.length} allowed miner(s)` : ' · any signed vote counts'}`);
+    logDown.at = 0; logDown.error = null;
     return logImpl;
   }
-  const ready = () => (started || (started = boot().catch((e) => { logFn(`[l3rig] log unavailable: ${e.message}`); started = null; logImpl = null; throw e; })));
+  const ready = () => {
+    if (started) return started;
+    if (logDown.at && Date.now() - logDown.at < retryMs) return Promise.reject(new Error(`the L3 log is unavailable (${logDown.error}); next attempt in ${Math.ceil((retryMs - (Date.now() - logDown.at)) / 1000)} s`));
+    return (started = boot().catch((e) => { logFn(`[l3rig] log unavailable: ${e.message} — the book keeps running, fills settle without miners; retry in ${Math.round(retryMs / 1000)} s`); started = null; logImpl = null; logDown.at = Date.now(); logDown.error = e.message; throw e; }));
+  };
 
   function shardFor(shard) {
     let s = shards.get(shard);
@@ -337,27 +441,39 @@ export function createSequencerRig({
       rewardsRoot: () => ({ root: rewards.epochRootOf(s0.closedEpoch), epoch: s0.closedEpoch }),
       onEpoch,
     });
-    s = { shard, seq, quorum, sub: null, books, state, rewards, ready: null, get closedEpoch() { return s0.closedEpoch; } };
+    s = { shard, seq, quorum, sub: null, books, state, rewards, ready: null, failedAt: 0, booting: false, deferred: [], reconcile: null, get closedEpoch() { return s0.closedEpoch; } };
     shards.set(shard, s);
     // resume the chain from the log — the tail fixes index, epoch and prevRoot — then listen for the miners'
     // votes. The promise is kept so a caller can await the first order of a new market instead of having it
-    // settle unsequenced: a batch index cannot be handed out before the log says where the chain is.
-    s.ready = (async () => {
-      const impl = await ready();
-      await seq.resume();
-      // where finality resumes: the log's tail unless the caller still needs earlier batches (see resumeFrom)
-      let from = seq.index;
-      if (resumeFrom) { try { const r = await resumeFrom(shard); if (r != null && Number.isFinite(Number(r))) from = Math.max(0, Math.min(from, Number(r))); } catch (e) { logFn(`[l3rig] resumeFrom(${shard}) failed: ${e.message}`); } }
-      quorum.start(from);
-      if (from < seq.index) {
-        // offsets and indices coincide for a single-sequencer shard (one append per batch — see resume())
-        const rows = await impl.read(seq.topic, from, seq.index - from);
-        let n = 0; for (const { value } of rows) if (value && String(value.shard) === String(shard) && Number(value.index) >= from) { quorum.announce(value); n++; }
-        logFn(`[l3rig] ${shard}: re-announced ${n} batch(es) from index ${from} (log at ${seq.index}) for finality after restart`);
-      }
-      s.sub = await impl.subscribe(votesTopic(shard), 0, async ({ value }) => { try { await quorum.vote(value); } catch (e) { logFn(`[l3rig] vote rejected: ${e.message}`); } });
+    // settle unsequenced: a batch index cannot be handed out before the log says where the chain is. A boot that
+    // fails (the log down) marks the shard and prepare() re-arms it after the retry window.
+    s.boot = async () => {
+      s.booting = true;
+      try {
+        const impl = await ready();
+        // the log's own replay of the shard, then the chain's tail from it; the engine's books are reconciled
+        // with it — and renumbered as it — before the first new op is sequenced (see reconcile)
+        const shadow = await replayLog(impl, seq.topic, shard);
+        await seq.resume(shadow.last);
+        s.state.ops = shadow.state.seq;      // the shard's op counter continues the log's: every miner counts the same ops
+        reconcile(s, shadow);
+        // where finality resumes: the log's tail unless the caller still needs earlier batches (see resumeFrom)
+        let from = seq.index;
+        if (resumeFrom) { try { const r = await resumeFrom(shard); if (r != null && Number.isFinite(Number(r))) from = Math.max(0, Math.min(from, Number(r))); } catch (e) { logFn(`[l3rig] resumeFrom(${shard}) failed: ${e.message}`); } }
+        quorum.start(from);
+        if (from < seq.index) {
+          // offsets and indices coincide for a single-sequencer shard (one append per batch — see resume())
+          const rows = await impl.read(seq.topic, from, seq.index - from);
+          let n = 0; for (const { value } of rows) if (value && String(value.shard) === String(shard) && Number(value.index) >= from) { quorum.announce(value); n++; }
+          logFn(`[l3rig] ${shard}: re-announced ${n} batch(es) from index ${from} (log at ${seq.index}) for finality after restart`);
+        }
+        s.sub = await impl.subscribe(votesTopic(shard), 0, async ({ value }) => { try { await quorum.vote(value); } catch (e) { logFn(`[l3rig] vote rejected: ${e.message}`); } });
+        s.failedAt = 0;
+      } catch (e) { logFn(`[l3rig] shard ${shard} not ready: ${e.message}`); s.failedAt = Date.now(); }
+      finally { s.booting = false; }
       return s;
-    })().catch((e) => { logFn(`[l3rig] shard ${shard} not ready: ${e.message}`); return s; });
+    };
+    s.ready = s.boot();
     return s;
   }
 
@@ -370,6 +486,7 @@ export function createSequencerRig({
       if (stopping) return null;
       const s = shardFor(shardOf(book.market, book.outcome));
       s.state.track(book);
+      if (!s.seq.ready && !s.booting && s.failedAt && Date.now() - s.failedAt >= retryMs) s.ready = s.boot();   // the log may be back
       try { await s.ready; } catch {}
       return s.seq.ready ? s.shard : null;
     },
@@ -378,22 +495,27 @@ export function createSequencerRig({
     /// which sequence number — the commitment needs it; without it the book is asked). Returns the slot the fills
     /// belong to, or null when the log is not up yet (the caller then settles them as it does today).
     record(book, rec, fills = [], result = undefined) {
-      if (stopping) return null;
+      if (stopping) { stats.skipped++; return null; }
       const s = shardFor(shardOf(book.market, book.outcome));
       s.state.applied(book, rec, fills, result);                 // the commitment mirrors the engine's book, sequenced or not
-      if (!s.seq.ready) { stats.skipped++; return null; }         // before the log is up: settle as today
+      const op = { t: 'add', hash: rec.hash, market: book.market, outcome: book.outcome, order: serializeL3Order(rec.o), sig: rec.sig, signer: lower(rec.signer || rec.o.user), at: rec.at || Date.now() };
+      // the log not resumed yet: the op is already in the engine's book, so it is kept and sequenced — in order —
+      // the moment the shard is up (reconcile); its fills settle as today (null slot). An op dropped here used to
+      // leave the engine's book and the miners' apart for good.
+      if (!s.seq.ready || s.deferred.length) { s.deferred.push({ op, fills }); return null; }
       s.state.ops++;
       stats.records++;
-      return s.seq.record({ t: 'add', hash: rec.hash, market: book.market, outcome: book.outcome, order: serializeL3Order(rec.o), sig: rec.sig, signer: lower(rec.signer || rec.o.user), at: rec.at || Date.now() }, fills);
+      return s.seq.record(op, fills);
     },
     recordCancel(book, rec, by = 'user', cancelled = undefined) {
-      if (stopping) return null;
+      if (stopping) { stats.skipped++; return null; }
       const s = shardFor(shardOf(book.market, book.outcome));
       s.state.cancelled(book, rec, cancelled);
-      if (!s.seq.ready) { stats.skipped++; return null; }
+      const op = { t: 'cancel', hash: rec.hash, market: book.market, outcome: book.outcome, user: lower(rec.o.user), by, at: Date.now() };
+      if (!s.seq.ready || s.deferred.length) { s.deferred.push({ op, fills: [] }); return null; }
       s.state.ops++;
       stats.records++;
-      return s.seq.record({ t: 'cancel', hash: rec.hash, market: book.market, outcome: book.outcome, user: lower(rec.o.user), by, at: Date.now() }, []);
+      return s.seq.record(op, []);
     },
     /// force a seal on every shard (used by tests and by a graceful shutdown)
     async flush() { for (const s of shards.values()) await s.seq.flush(); },
@@ -401,8 +523,8 @@ export function createSequencerRig({
     /// the sorted finality signatures a finalized batch has now (quorum.js finalSigsOf), or null
     finalSigsOf(shard, index) { const s = shards.get(String(shard)); return s ? s.quorum.finalSigsOf(index) : null; },
     status() {
-      const out = { log: logImpl ? logImpl.kind : 'starting', dir: logImpl?.dir || null, threshold, ...stats, shards: {} };
-      for (const [k, s] of shards) out.shards[k] = { sequencer: s.seq.status(), quorum: s.quorum.status(), rewardsEpochClosed: s.closedEpoch };
+      const out = { log: logImpl ? logImpl.kind : logDown.at ? 'unavailable' : 'starting', logError: logDown.error, logAttempts: logDown.attempts, dir: logImpl?.dir || null, threshold, ...stats, shards: {} };
+      for (const [k, s] of shards) out.shards[k] = { sequencer: s.seq.status(), quorum: s.quorum.status(), rewardsEpochClosed: s.closedEpoch, deferred: s.deferred.length, reconcile: s.reconcile };
       return out;
     },
     async stop() {

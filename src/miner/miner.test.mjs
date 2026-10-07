@@ -604,3 +604,155 @@ async function rigScenario({ commit = 'bookhash' } = {}) {
 }
 test('the rig sequences the engine\'s own fills and releases them on finality', () => rigScenario({ commit: 'bookhash' }));
 test('L3_COMMIT=tree: the rig\'s commitment is fed by the engine\'s own add and cancel results and equals the miner\'s', () => rigScenario({ commit: 'tree' }));
+
+// ------------------------------------------------------------------------- the engine's book vs the log, at a boot
+/**
+ * The incident of 2026-10-07: the engine's book is rebuilt from its journal at a restart, the miners' from the log,
+ * and an op the engine applied that never reached the log — the market maker's shutdown cancel-all, journaled
+ * within batchMs of process.exit — made every epoch commitment of the shard differ for good (the matcher's
+ * sequence counter advances on cancels too, and it is in every resting leaf and every fill leaf). This scenario
+ * reproduces it with the old boot (no reconcile), then boots the rig as book.js does now and checks the shard heals:
+ * the lost cancel and the lost order are sequenced, an op that arrived during the resume follows, the engine's
+ * matchers are renumbered as the log's, and the next epoch boundary agrees. Then the miner's own restart: a journal
+ * holding an honest dissent replays cleanly (new and old journal shapes), finality resumes after the replay, and a
+ * journal that really is corrupt is still thrown away.
+ */
+async function reconcileScenario() {
+  const { privateKeyToAccount, generatePrivateKey } = await import('viem/accounts');
+  const { BOOK_DOMAIN, L3_ORDER_TYPES, l3OrderFor, serializeL3Order, parseL3Order } = await import('../desk.js');
+  const { createSequencerRig, createSequencer } = await import('./sequencer.js');
+  const { createMiner } = await import('./miner.js');
+  const { createBook } = await import('../matcher.js');
+  const { createLog } = await import('./log.js');
+
+  const dir = tmp('reconcile');
+  const E = 10n ** 18n, MARKET = 93, SHARD = '93';
+  const operator = privateKeyToAccount(generatePrivateKey());
+  const minerAcct = privateKeyToAccount(generatePrivateKey());
+  const env = { L3_LOG: 'file', L3_LOG_DIR: path.join(dir, 'log'), L3_THRESHOLD: '1', L3_BATCH_MS: '20', L3_BATCH_MAX: '50', L3_EPOCH_BATCHES: '2', CHAIN_ID: '46630' };
+  const domain = BOOK_DOMAIN(46630, '0x' + 'b0'.repeat(20));
+  const token = '0x' + 'c0'.repeat(20);
+  const trader = privateKeyToAccount(generatePrivateKey());
+
+  // the engine's side: its books and order records, and the rig's three hooks exactly as book.js wires them
+  const books = new Map(); const orders = new Map();
+  const bookFor = (outcome) => { const key = `${MARKET}:${outcome}`; let b = books.get(key); if (!b) { b = { key, market: MARKET, outcome, token, m: createBook() }; books.set(key, b); } return b; };
+  const engineOrders = () => [...books.values()].flatMap((b) => b.m.orders());
+  const hooks = { booksOf: () => [...books.values()], recOf: (hash) => orders.get(hash) || null, swapBook: (b, m) => { b.m = m; } };
+  const makeRig = () => createSequencerRig({ env, dir: path.join(dir, 'log'), account: operator, logger: () => {}, onFinal: () => {}, onFork: () => {}, ...hooks });
+  let n = 0;
+  const signed = async (outcome, buy, cents) => {
+    const o = l3OrderFor({ user: trader.address, marketId: MARKET, outcome, token, buy, price: BigInt(cents) * E / 100n, size: 2n * E, postOnly: true });
+    o.nonce = BigInt(1700000000000 + n); o.salt = BigInt(++n);
+    const sig = await trader.signTypedData({ domain, types: L3_ORDER_TYPES, primaryType: 'L3Order', message: o });
+    const hash = orderHash(domain, serializeL3Order(o));
+    const rec = { hash, o: parseL3Order(serializeL3Order(o)), sig, signer: trader.address.toLowerCase(), at: Date.now() };
+    orders.set(hash, rec); return rec;
+  };
+  const add = (b, rec) => b.m.add({ hash: rec.hash, user: rec.o.user.toLowerCase(), buy: rec.o.buy, price: rec.o.price, size: rec.o.size, postOnly: rec.o.postOnly });
+  const readLog = async (log) => (await log.read(ordersTopic(SHARD), 0, 100)).map((r) => r.value);
+
+  // ---- session 1: three resting orders on two books, sequenced; a miner follows and agrees at the boundary (#1) ----
+  let rig = makeRig(); await rig.ready();
+  const b0 = bookFor(0), b1 = bookFor(1);
+  assert.equal(await rig.prepare(b0), SHARD); assert.equal(await rig.prepare(b1), SHARD);
+  const r1 = await signed(0, true, 40), r2 = await signed(0, true, 41), r3 = await signed(1, false, 60);
+  for (const [b, rec] of [[b0, r1], [b0, r2], [b1, r3]]) { const r = add(b, rec); assert.ok(rig.record(b, rec, r.fills, r)); await rig.flush(); }
+  const log = await createLog({ env, dir: path.join(dir, 'log'), logger: () => {} });
+  const mk = () => createMiner({ shard: SHARD, log, account: minerAcct, domain, dir: path.join(dir, 'miner'), workers: 0, sequencers: [operator.address], threshold: 1, logger: () => {}, env });
+  let miner = mk(); await miner.start();
+  const upTo = async (m, i) => { const dl = Date.now() + 30000; while (Date.now() < dl && m.index < i) await new Promise((r) => setTimeout(r, 10)); assert.equal(m.index, i, `the miner is at ${m.index}, not ${i}`); };
+  const finalAt = async (q, i) => { const dl = Date.now() + 30000; while (Date.now() < dl && q.finalIndex < i) await new Promise((r) => setTimeout(r, 10)); assert.equal(q.finalIndex, i, `finality is at ${q.finalIndex}, not ${i}`); };
+  await upTo(miner, 2);
+  assert.equal(miner.metrics().dissents, 0);
+  assert.equal(miner.state.bookHash(), bookHashOf(engineOrders()));
+
+  // ---- the shutdown: the engine's book changes and the log never hears of it ----
+  await rig.stop();
+  assert.ok(b0.m.cancel(r1.hash), 'the 40¢ bid was not resting');                       // the market maker's cancel-all, batchMs before exit
+  const r4 = await signed(1, false, 61); assert.ok(add(b1, r4).rested);                   // an order whose batch never reached the log
+
+  // ---- the next boot as it was: no reconcile, a new order sequenced on top of a book the log does not have ----
+  const log1 = await createLog({ env, dir: path.join(dir, 'log'), logger: () => {} });
+  const adapter = { ops: 0, get seq() { return this.ops; }, bookHash: () => bookHashOf(engineOrders()) };
+  const oldSeq = createSequencer({ shard: SHARD, log: log1, account: operator, state: adapter, batchMs: 20, batchMax: 50, epochBatches: 2, logger: () => {} });
+  await oldSeq.resume(); assert.equal(oldSeq.index, 3);
+  const r5 = await signed(0, true, 39); assert.ok(add(b0, r5).rested);
+  assert.equal(b0.m.get(r5.hash).seq, 4, 'the engine numbered the new bid after the cancel the log never got');
+  adapter.ops++; oldSeq.record({ t: 'add', hash: r5.hash, market: MARKET, outcome: 0, order: serializeL3Order(r5.o), sig: r5.sig, signer: r5.signer, at: r5.at }, []);
+  await oldSeq.flush(); await oldSeq.stop(); await log1.close();
+  await upTo(miner, 3);
+  assert.equal(miner.metrics().dissents, 1, 'the miner did not catch the engine\'s book drifting from the log at the epoch boundary');
+  assert.equal(miner.state.books.get(`${MARKET}:0`).get(r5.hash).seq, 3, 'the miner numbers the bid as the log does');
+
+  // ---- the boot as it is now: a cancel arrives while the shard's log is being resumed (the start cancel-all) ----
+  rig = makeRig();
+  assert.equal(rig.recordCancel(b0, r2, 'user', b0.m.cancel(r2.hash)), null, 'an op before the resume has no slot');
+  assert.equal(rig.status().shards[SHARD].deferred, 1, 'the op was not deferred');
+  assert.equal(await rig.prepare(b0), SHARD);
+  const st = rig.status();
+  assert.equal(st.shards[SHARD].deferred, 0, 'the deferred op was not drained');
+  const rc = st.shards[SHARD].reconcile;
+  assert.ok(rc, 'no reconcile ran');
+  assert.equal(rc.logBatches, 4); assert.equal(rc.logOps, 4); assert.equal(rc.books, 2);
+  assert.equal(rc.cancelled, 1, 'the lost cancel was not sequenced'); assert.equal(rc.resequenced, 1, 'the lost order was not re-sequenced');
+  assert.equal(rc.deferred, 1); assert.equal(rc.unreconciled, 0); assert.equal(rc.kept, 0);
+  assert.equal(rc.rebuilt, 2, 'the two books were not renumbered as the log');
+  assert.equal(st.deferred, 1); assert.equal(st.reconciled, 2); assert.equal(st.skipped, 0, 'an op was dropped');
+  assert.equal(b0.m.get(r5.hash).seq, 3, 'the engine\'s book was not renumbered as the miners\' after the reconcile');
+  assert.equal(b0.m.size, 1); assert.equal(b1.m.size, 2);
+  await rig.flush();
+  // the log now carries, in this order: the lost cancel (by 'reconcile'), the lost order, the deferred cancel
+  let rows = await readLog(log);
+  assert.equal(rows.length, 5);
+  assert.deepEqual(rows[4].ops.map((o) => o.t), ['cancel', 'add', 'cancel']);
+  assert.equal(rows[4].ops[0].hash, r1.hash); assert.equal(rows[4].ops[0].by, 'reconcile'); assert.equal(rows[4].ops[1].hash, r4.hash); assert.equal(rows[4].ops[2].hash, r2.hash); assert.equal(rows[4].ops[2].by, 'user');
+  // the op counter continues the log's count of ops (it restarted at 0 on every boot: the live log read "seq 19-1")
+  assert.equal(rows[4].seqFrom, rows[3].seqTo + 1); assert.equal(rows[4].seqTo, 4 + 3);
+  await upTo(miner, 4);
+  assert.equal(miner.metrics().dissents, 1, 'the reconcile batch itself was dissented on');
+  assert.equal(miner.state.bookHash(), bookHashOf(engineOrders()), 'the miner and the engine still hold different books');
+  // the next epoch boundary (#5) agrees, and the rig's quorum finalizes it
+  const r6 = await signed(1, false, 62); { const r = add(b1, r6); assert.ok(rig.record(b1, r6, r.fills, r)); }
+  await rig.flush(); await upTo(miner, 5);
+  rows = await readLog(log);
+  assert.notEqual(rows[5].bookHash, ZERO32); assert.equal(rows[5].seqFrom, 8); assert.equal(rows[5].seqTo, 8);
+  assert.equal(miner.metrics().dissents, 1, 'the boundary after the reconcile was dissented on');
+  assert.equal(miner.bookHash, rows[5].bookHash);
+  const q = rig.shard(SHARD).quorum;
+  await finalAt(q, 5);
+  assert.equal(q.halted, false); assert.equal(rig.status().shards[SHARD].quorum.forks, 0);
+
+  // ---- the miner's restart: a journal holding an honest dissent is its own history, not corruption ----
+  await miner.stop();
+  const minerDir = path.join(dir, 'miner');
+  const noCorrupt = () => assert.ok(!fs.readdirSync(minerDir).some((f) => f.includes('.corrupt.')), 'the journal was thrown away');
+  miner = mk(); await miner.start();
+  assert.equal(miner.metrics().replayed, 6, `replayed ${miner.metrics().replayed} of 6`); assert.equal(miner.index, 5); assert.equal(miner.metrics().dissents, 0, 'the replay re-counted the old dissent'); noCorrupt();
+  assert.equal(miner.state.bookHash(), bookHashOf(engineOrders()));
+  assert.equal(miner.quorum.finalIndex, 5, 'finality did not resume after the replay');
+  const r7 = await signed(0, true, 38); { const r = add(b0, r7); assert.ok(rig.record(b0, r7, r.fills, r)); }
+  await rig.flush(); await upTo(miner, 6);
+  assert.equal(miner.metrics().votes, 1); assert.equal(miner.metrics().dissents, 0);
+  await finalAt(miner.quorum, 6); await finalAt(q, 6);
+  await miner.stop();
+  // an older miner's journal (no `root` on its lines): what it signed is in its votes journal
+  const jb = path.join(minerDir, `${SHARD}.batches.jsonl`);
+  fs.writeFileSync(jb, fs.readFileSync(jb, 'utf8').split('\n').filter(Boolean).map((l) => { const r = JSON.parse(l); delete r.root; delete r.ok; return JSON.stringify(r); }).join('\n') + '\n');
+  miner = mk(); await miner.start();
+  assert.equal(miner.metrics().replayed, 7); assert.equal(miner.metrics().dissents, 0); noCorrupt(); assert.equal(miner.quorum.finalIndex, 6);
+  await miner.stop();
+  // a journal that really is corrupt (a batch's ops rewritten) is still thrown away, and the shard re-read from the log
+  fs.writeFileSync(jb, fs.readFileSync(jb, 'utf8').split('\n').filter(Boolean).map((l, i) => { const r = JSON.parse(l); if (i === 2) r.batch.ops = []; return JSON.stringify(r); }).join('\n') + '\n');
+  miner = mk(); await miner.start();
+  assert.ok(fs.readdirSync(minerDir).some((f) => f.includes('.corrupt.')), 'a corrupt journal was kept');
+  await upTo(miner, 6);
+  assert.equal(miner.metrics().replayed, 2, 'the replay did not stop at the rewritten batch');
+  assert.equal(miner.metrics().dissents, 1, 'the historical boundary (#3) is still what it was: an honest dissent, once');
+  assert.equal(miner.state.bookHash(), bookHashOf(engineOrders()));
+  await miner.stop();
+
+  await log.close(); await rig.stop();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+test('the rig reconciles the engine\'s book with the log at boot (a cancel the log never got, an order it never got, an op deferred during the resume), renumbers the book as the miners\', and the next epoch boundary agrees; a miner replays a journal holding its own dissent and resumes finality', () => reconcileScenario());

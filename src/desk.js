@@ -154,6 +154,52 @@ export const l3CancelAllMessage = (ts) => `RollMarkets L3 cancel-all ${ts}`;
 export async function signL3CancelWithSession(sessionPk, hash, ts) { return privateKeyToAccount(sessionPk).signMessage({ message: l3CancelMessage(hash, ts) }); }
 export async function signL3CancelAllWithSession(sessionPk, ts) { return privateKeyToAccount(sessionPk).signMessage({ message: l3CancelAllMessage(ts) }); }
 
+// ---- the on-chain cancel-all (bumpNonce), tolerant of the 2026-10-04 fix -------------------------------
+// RollaBook.bumpNonce() sets the user's nonce floor to block.timestamp·1000 and, since the fix pass, reverts
+// NonceVoid when that would NOT raise the floor (a second bump in the same second, or a floor already set in the
+// future by setMinNonce). The deployed testnet book still carries the old code (no revert); both behave the same
+// through these helpers: a NonceVoid is "already at this floor" — the orders are void, nothing to do — and when
+// the floor already equals now, setMinNonce(floor + 1) raises it by a millisecond instead of reverting.
+/// RollaBook / RollaBookL3 custom errors, so a simulation or a receipt reads as a name
+export const BOOK_ERRORS = ['BadSignature', 'Expired', 'Cancelled_', 'NonceVoid', 'Mismatch', 'BadPrice', 'OverSize', 'ZeroSize', 'LengthMismatch', 'NotAuthorised', 'NotBook', 'NoGrant', 'OverCap', 'Insufficient',
+  'AlreadyFinal', 'NotFinal', 'Discontinuous', 'TooFewSigners', 'NotMiner', 'Unsorted', 'BadProof', 'AlreadySettled', 'BadLeafIndex', 'ZeroThreshold'].map((name) => ({ type: 'error', name, inputs: [] }));
+/// the custom error name inside a viem error (ContractFunctionExecutionError → ContractFunctionRevertedError), if any
+export function bookErrorName(e) {
+  if (!e) return null;
+  const direct = e?.cause?.data?.errorName || e?.data?.errorName || null; if (direct) return direct;
+  if (typeof e.walk === 'function') { try { const x = e.walk((y) => y?.data?.errorName); if (x?.data?.errorName) return x.data.errorName; } catch {} }
+  const m = /\b(NonceVoid|BadSignature|Expired|Cancelled_|NoGrant|OverCap|Insufficient|NotAuthorised)\b/.exec(String(e.shortMessage || e.message || '')); return m ? m[1] : null;
+}
+export const isNonceVoid = (e) => bookErrorName(e) === 'NonceVoid';
+/// what to send to void every order signed so far: bumpNonce() when it raises the floor, setMinNonce(floor + 1)
+/// when the floor is already at (or past) this second — the shape of the contract's own rule, computed off chain
+export function nonceBumpPlan({ minNonce, nowMs = Date.now() }) {
+  const min = BigInt(minNonce || 0); const floorNow = BigInt(Math.floor(Number(nowMs) / 1000)) * 1000n;
+  if (min >= floorNow) return { fn: 'setMinNonce', args: [min + 1n], floor: min + 1n, why: 'the floor already covers this second' };
+  return { fn: 'bumpNonce', args: [], floor: floorNow };
+}
+/**
+ * voidAllL3Orders({ book, user, read, simulate, write, wait }) → { ok, tx?, fn?, minNonce, skipped?, why? }
+ *   read(fn, args)      a view call on `book`          simulate(fn, args)  an eth_call of the write (may be null)
+ *   write(fn, args)     sends the transaction → hash   wait(hash)          → receipt (may be null)
+ * Reads the floor, plans the call, simulates it (a NonceVoid there is a no-op success: the floor is already where
+ * the bump would put it), sends it, and treats a reverted receipt whose floor is nevertheless at or past the plan
+ * as success too (a bump mined in the same second as another one).
+ */
+export async function voidAllL3Orders({ book, user, read, simulate = null, write, wait = null, nowMs = null }) {
+  const min = BigInt(await read('minNonce', [user]));
+  const plan = nonceBumpPlan({ minNonce: min, nowMs: nowMs ?? Date.now() });
+  if (simulate) { try { await simulate(plan.fn, plan.args); } catch (e) { if (isNonceVoid(e)) return { ok: true, skipped: true, minNonce: min, why: 'already at this floor: every order signed so far is void' }; throw e; } }
+  let tx; try { tx = await write(plan.fn, plan.args); } catch (e) { if (isNonceVoid(e)) return { ok: true, skipped: true, minNonce: min, why: 'already at this floor: every order signed so far is void' }; throw e; }
+  const receipt = wait ? await wait(tx) : null;
+  if (receipt && receipt.status !== 'success') {
+    const after = BigInt(await read('minNonce', [user]));
+    if (after >= plan.floor) return { ok: true, skipped: true, tx, minNonce: after, why: 'the floor was raised by another transaction first' };
+    const err = new Error(`${plan.fn} reverted (${tx})`); err.tx = tx; throw err;
+  }
+  return { ok: true, tx, fn: plan.fn, minNonce: plan.floor, book };
+}
+
 // ---- miner finality (RollaBookL3.sol, docs/L3-MINERS.md §4) ----------------------------------------
 // RollaBookL3 is RollaBook plus two functions. `attest(L3Final, sigs)` records a batch root once `threshold`
 // distinct staked miners (RollaL3Miners) signed the EIP-712 `L3Final` below — same domain as the orders

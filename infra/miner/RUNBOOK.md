@@ -31,11 +31,43 @@ Metrics (Prometheus text, one series per shard, `rolla_l3_*`): `batches_total`, 
 `stalled`, `halted`, `rewards_micro`; fleet-wide `fleet_shards`, `fleet_listed_shards`, `fleet_polls_total`,
 `fleet_poll_errors_total`, `fleet_last_poll_ok_seconds`, `fleet_start_failures_total`, `fleet_ready`, `up`.
 
-A stalled or dissenting shard does not clear itself — the miner refuses to go past the batch it disagrees with, by design.
-Read `fly logs` for the `[l3miner] DISSENT …` / `stalled` line, decide who is wrong (docs/L3-MINERS.md §5, §7), and only
-then restart: `fly machine restart <id> -a rollmarkets-miner-N`. A restart replays the shard from the miner's own journal
-on `/data` and continues from the log; if the journal itself is the problem, `fly ssh console -a … -C "rm /data/l3-miner/<shard>.batches.jsonl"`
-makes the miner re-read that shard from the log's beginning.
+A stalled shard does not clear itself — the miner refuses to go past the batch it cannot apply, by design. A dissent
+does not stop the miner (it keeps replaying and voting; its own quorum view halts), but it keeps `/healthz` at 503 — and
+Fly's proxy stops routing to a machine whose check is critical, so the public `/healthz` hangs: read it from inside with
+`fly ssh console -a rollmarkets-miner-N -C "curl -s localhost:8080/healthz"`, or `fly logs` for the heartbeat line.
+Read `fly logs` for the `[l3miner] DISSENT …` / `stalled` line, decide who is wrong (docs/L3-MINERS.md §5, §7, and the
+section below), and only then restart: `fly machine restart <id> -a rollmarkets-miner-N`. A restart replays the shard from
+the miner's own journal on `/data` — a dissent it signed is reproduced from its own root (since the image of 2026-10-07; an
+older journal line is matched against the votes journal), so history is not corruption, the counter starts at 0 and the
+shard is healthy again as long as the next batches agree; finality resumes after the replay point. If the journal itself
+is the problem (a batch rewritten), the miner says so, moves it to `<shard>.batches.jsonl.corrupt.<ts>` and re-reads the
+shard from the log's beginning by itself; `fly ssh console -a … -C "rm /data/l3-miner/<shard>.batches.jsonl"` forces that.
+
+## A dissent on every epoch boundary (the fork of 2026-10-07)
+
+Symptom: all three miners dissent on the SAME batches, every one an epoch boundary (`index % L3_EPOCH_BATCHES == 19`),
+`fillsRoot` equal to the sequencer's (the fills agree), only `bookHash` differs; the engine's `/v1/l3/status` shows the
+shard's quorum `halted: true` with `forks` = 3 per boundary. That is not a miner bug: the engine's own book no longer
+matches the log it sequenced. The engine rebuilds its book from its journal at a restart, the miners from the log, and an
+op the engine applied that never reached the log (the market maker's shutdown cancel-all within batchMs of
+`process.exit`; an order the replay expired; a cancel applied while the shard's log was still being resumed) leaves the
+two apart — the matcher's sequence counter advances on cancels too and is in every resting leaf and every fill leaf, so
+the shard would never agree again on its own. Diagnose it in one command from the proto monorepo (no vote is published):
+replay the shard's log with the miner's state machine and compare with the batches' roots (the scratch script of the
+incident did `createKafkaLog` → `read(orders.<shard>, 0, n)` → `createShardState().apply` per op → `batchRootOf`); a
+`DIFF` only at boundaries, with the resting book holding orders the engine's journal shows as cancelled before a boot, is
+this case.
+
+Fix (engine side, proto `c230b22`): at every shard boot the rig replays the shard's log, sequences what the log never
+got (`cancel … by: 'reconcile'`, re-sequenced adds, the ops deferred during the resume) and replaces its matchers by
+the log's replay, so the counters are the miners'. `/v1/l3/status` → `miners.reconciled / deferred / unreconciled /
+rebuilt` and per shard `reconcile { cancelled, resequenced, deferred, rebuilt, kept }` say what it did. Order of
+operations for the fleet: (1) deploy the engine; (2) roll this image (`for N in 1 2 3; do bash infra/miner/deploy.sh $N;
+done`, one at a time) — the restart replays each journal, dissents included, and comes back `ok:true`; a miner rolled
+before the engine deploy dissents once more at the next boundary and needs one more `fly machine restart` after it.
+Nothing on chain: the quorum halts are in memory on the engine and clear with its deploy; the historical boundary
+batches stay in the log as they are (a miner re-reading a shard from offset 0 will dissent on them again, honestly, and
+go on).
 
 ## Roll the image
 

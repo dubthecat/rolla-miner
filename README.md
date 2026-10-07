@@ -47,7 +47,7 @@ Local cluster: `MINER1_KEY=0x… MINER2_KEY=0x… MINER3_KEY=0x… docker compos
 ## Fly fleet (production)
 
 Three always-on miners — `rollmarkets-miner-1/2/3` in `ams`, one app and one shared-cpu-2x / 1 GB machine each, the
-three keys registered on `RollaL3Miners` `0x4a95…1fe0` (threshold 2) — run this image in **fleet mode** from
+three keys registered on `RollaL3Miners` `0xa5f7…db76` (the v3 registry of 2026-10-04; threshold 2) — run this image in **fleet mode** from
 `infra/miner/fly.toml`: they follow `https://rollmarkets.com/v1/l3/markets` every minute and mine every listed shard off
 the Fly broker, sign `L3Final` for `RollaBookL3`, and answer `/healthz` + `/metrics` at `https://rollmarkets-miner-N.fly.dev/`.
 `infra/miner/deploy.sh N` creates and deploys one (idempotent; the key is read from `~/.rollacoasta-keys/l3-miner-N.key`

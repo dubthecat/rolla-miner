@@ -140,7 +140,7 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
 /// group, because every miner must see EVERY record, not a share of them (this is a replicated log, not a work
 /// queue; the earlier concept's `group.id: 'validators'` load-balanced orders across validators, which is
 /// exactly what must NOT happen here).
-export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPrefix = 'rolla-l3', ssl = undefined, sasl = undefined, logger = null, partitions = 1, replication = 1, acks = -1, connectionTimeout = 10000, retries = 2 } = {}) {
+export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPrefix = 'rolla-l3', ssl = undefined, sasl = undefined, logger = null, partitions = 1, replication = 1, acks = -1, connectionTimeout = 10000, retries = 2, readTimeoutMs = 15000 } = {}) {
   const list = Array.isArray(brokers) ? brokers : String(brokers || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!list.length) throw new Error('KafkaLog needs L3_KAFKA_BROKERS');
   let Kafka, logLevel;
@@ -182,23 +182,36 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     return base != null ? Number(base) : -1;
   }
 
-  return {
+  const self = {
     kind: 'kafka', brokers: list,
     async append(topic, msg) { return send(topic, [msg]); },
-    async appendMany(topic, msgs) { return msgs.length ? send(topic, msgs) : this.offset(topic); },
+    async appendMany(topic, msgs) { return msgs.length ? send(topic, msgs) : self.offset(topic); },
     async offset(topic) {
       await ensure(topic);
       const o = await withLeader(`offsets ${topic}`, () => admin.fetchTopicOffsets(topic));
       return Number(o?.[0]?.high ?? 0);
     },
+    /// watermark-driven: the records the topic holds NOW from `fromOffset` (at most `limit`), returned as soon as
+    /// they are all in — not after a fixed window. A new consumer group's first rebalance can take seconds on a
+    /// broker (group.initial.rebalance.delay), longer than the 3 s this used to wait: the sequencer's tail read
+    /// (resume()) came back empty and a restarted shard would have started a second chain from index 0. Verified
+    /// against the Fly broker by log-kafka.test.mjs. A read that is still short at readTimeoutMs returns what it has.
     async read(topic, fromOffset = 0, limit = 500) {
-      const out = [];
+      const high = await self.offset(topic); const from = Math.max(0, Number(fromOffset) || 0);
+      const want = Math.min(Number(limit) || 0, Math.max(0, high - from)); if (want <= 0) return [];
+      const out = []; const seen = new Set(); let sub = null, done = false, timer = null;
       await new Promise((resolve, reject) => {
-        this.subscribe(topic, fromOffset, async ({ offset, value }) => { out.push({ offset, value, topic }); if (out.length >= limit) resolve(); })
-          .then((sub) => { setTimeout(() => { sub.close().finally(resolve); }, 3000); }, reject);
+        const finish = () => { if (done) return; done = true; if (timer) clearTimeout(timer); resolve(); };
+        self.subscribe(topic, from, async ({ offset, value }) => {
+          if (done || offset < from || offset >= from + want || seen.has(offset)) return;
+          seen.add(offset); out.push({ offset, value, topic }); if (out.length >= want) finish();
+        }).then((s) => { sub = s; if (done) return; timer = setTimeout(() => { logger && logger(`[l3log] read ${topic}@${from}: ${out.length}/${want} record(s) within ${readTimeoutMs} ms`); finish(); }, readTimeoutMs); }, reject);
       });
-      return out.slice(0, limit);
+      if (sub) sub.close().catch(() => {});
+      return out.sort((a, b) => a.offset - b.offset);
     },
+    /// delete a topic (scratch topics of a check; never a shard's)
+    async drop(topic) { known.delete(topic); await admin.deleteTopics({ topics: [topic] }); },
     async subscribe(topic, fromOffset, handler) {
       await ensure(topic);
       const groupId = `${groupPrefix}-${topic}-${Math.random().toString(36).slice(2, 10)}`;
@@ -229,6 +242,7 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
       try { await admin.disconnect(); } catch {}
     },
   };
+  return self;
 }
 
 /// pick an implementation from the environment: L3_LOG=file|kafka (default file), L3_LOG_DIR, L3_KAFKA_BROKERS.
@@ -236,7 +250,8 @@ export async function createLog({ env = process.env, dir = null, clientId = 'rol
   const kind = (env.L3_LOG || 'file').toLowerCase();
   if (kind === 'kafka' || kind === 'redpanda') {
     return createKafkaLog({ brokers: env.L3_KAFKA_BROKERS || '127.0.0.1:9092', clientId, logger,
-      replication: Number(env.L3_KAFKA_REPLICATION || 1), retries: Number(env.L3_KAFKA_RETRIES || 2),
+      replication: Number(env.L3_KAFKA_REPLICATION || 1), retries: Number(env.L3_KAFKA_RETRIES || 2), readTimeoutMs: Number(env.L3_KAFKA_READ_MS || 15000),
+      connectionTimeout: Number(env.L3_KAFKA_CONNECT_MS || 10000),
       ssl: env.L3_KAFKA_SSL === '1' ? {} : undefined,
       sasl: env.L3_KAFKA_USER ? { mechanism: env.L3_KAFKA_MECHANISM || 'scram-sha-256', username: env.L3_KAFKA_USER, password: env.L3_KAFKA_PASS || '' } : undefined });
   }

@@ -21,9 +21,10 @@ primary_region = "ams"
   L3_ENGINE_URL = "https://rollmarkets.com"
   L3_MARKETS_POLL_MS = "60000"
   # the EIP-712 domain the orders are signed under (RollaBookL3 with the engine on L3_SETTLE=root) and the book whose
-  # L3Final the miner signs. deploy.sh overrides both with BOOK_L3=0x… when the contract is redeployed.
-  PREDICT_BOOK = "0xa1d51c4e00926cb7b2e640bff13039d8849c4450"
-  PREDICT_BOOK_L3 = "0xa1d51c4e00926cb7b2e640bff13039d8849c4450"
+  # L3Final the miner signs: the ACTIVE v3 pair since the versioned redeploy of 2026-10-04 (the rc book 0xa1d5…4450 is
+  # retired). deploy.sh sets both from BOOK_L3 (same default) when the contract is redeployed.
+  PREDICT_BOOK = "0xfc39ab228ec5a77e681f2fa3c9491ca07456c9bc"
+  PREDICT_BOOK_L3 = "0xfc39ab228ec5a77e681f2fa3c9491ca07456c9bc"
   CHAIN_ID = "46630"
   # the only sequencer whose batches count: the engine operator. Anything else stalls the shard (and the health check).
   L3_SEQUENCERS = "0x4f2689f90a854173d5AC9Ac44c318D79011D3267"

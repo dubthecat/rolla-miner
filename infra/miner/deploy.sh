@@ -15,7 +15,9 @@ APP=${APP:-rollmarkets-miner-$N}
 REGION=${REGION:-ams}
 ORG=${FLY_ORG:-personal}
 KEY=${L3_MINER_KEY_FILE:-$HOME/.rollacoasta-keys/l3-miner-$N.key}
-BOOK_L3=${BOOK_L3:-0xa1d51c4e00926cb7b2e640bff13039d8849c4450}
+# the ACTIVE RollaBookL3 (v3, since the versioned redeploy of 2026-10-04): the orders' EIP-712 domain and the L3Final book. The
+# retired rc pair (0xa1d5…4450) was the default until 2026-10-07 — a deploy without BOOK_L3= would have re-pointed the fleet to it.
+BOOK_L3=${BOOK_L3:-0xfc39ab228ec5a77e681f2fa3c9491ca07456c9bc}
 IMAGE=${IMAGE:-ghcr.io/dubthecat/rolla-miner:latest}
 VOLUME=minerdata
 HERE=$(cd "$(dirname "$0")" && pwd)

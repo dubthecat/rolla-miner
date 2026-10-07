@@ -249,7 +249,7 @@ export function createMiner({
       if (ok) m.votes++;
       else { m.dissents++; logFn(`[l3miner] DISSENT on ${shard}#${mine.index}: ${why}${myRoot !== batch.batchRoot ? ` (mine ${myRoot.slice(0, 12)}…, theirs ${String(batch.batchRoot).slice(0, 12)}…)` : ' (the roots agree: the batch itself is invalid)'}`); }
 
-      append(jBatches, { offset: off, index: mine.index, epoch: mine.epoch, batch });   // the miner's own copy of the log
+      append(jBatches, { offset: off, index: mine.index, epoch: mine.epoch, root: myRoot, ok, batch });   // the miner's own copy of the log, with the root IT signed
       append(jVotes, vote);
       recent.set(mine.index, { batch, fills });
       if (recent.size > keepFills) { const oldest = Math.min(...recent.keys()); recent.delete(oldest); }
@@ -309,26 +309,34 @@ export function createMiner({
   /// the log at offset 0 instead. Signatures are NOT re-verified (5.6 ms each, on the miner's own disk) unless
   /// L3_VERIFY_REPLAY=1.
   function replayJournal() {
-    if (!jBatches || !fs.existsSync(jBatches)) return { ok: true, replayed: 0 };
+    if (!jBatches || !fs.existsSync(jBatches)) return { ok: true, replayed: 0, dissented: 0 };
     let lines = [];
-    try { lines = fs.readFileSync(jBatches, 'utf8').split('\n').filter(Boolean); } catch { return { ok: true, replayed: 0 }; }
-    let n = 0;
+    try { lines = fs.readFileSync(jBatches, 'utf8').split('\n').filter(Boolean); } catch { return { ok: true, replayed: 0, dissented: 0 }; }
+    // what this miner SIGNED for each batch is the expectation — a batch it dissented on is reproduced by its own
+    // root, not the sequencer's (a journal holding an honest dissent used to be thrown away as corrupt, the shard
+    // re-read from the log and the same dissent published again at every restart). The batch line carries it
+    // (`root`) since 2026-10-07; older lines are matched against the votes journal, and only then the batch's.
+    const voted = new Map();
+    if (jVotes && fs.existsSync(jVotes)) { try { for (const line of fs.readFileSync(jVotes, 'utf8').split('\n')) { if (!line) continue; try { const v = JSON.parse(line); if (v && Number.isFinite(Number(v.index)) && typeof v.batchRoot === 'string') voted.set(Number(v.index), v.batchRoot); } catch {} } } catch {} }
+    let n = 0, dissented = 0;
     for (const line of lines) {
       let rec; try { rec = JSON.parse(line); } catch { continue; }
       const batch = rec.batch; if (!batch || Number(batch.index) <= index) continue;
-      if (index >= 0 && Number(batch.index) !== index + 1) return { ok: false, why: `journal skips ${index} → ${batch.index}`, replayed: n };
+      if (index >= 0 && Number(batch.index) !== index + 1) return { ok: false, why: `journal skips ${index} → ${batch.index}`, replayed: n, dissented };
       const ops = Array.isArray(batch.ops) ? batch.ops : [];
       let fills = [];
       for (const op of ops) { const r = state.apply(op); if (r.fills?.length) fills.push(...r.fills); }
       state.flush();
       const bookHash = (batch.bookHash && batch.bookHash !== ZERO32) ? state.bookHash() : ZERO32;
       const myRoot = batchRootOf({ shard: String(shard), epoch: Number(batch.epoch), index: Number(batch.index), seqFrom: Number(batch.seqFrom), seqTo: Number(batch.seqTo), prevRoot: batch.prevRoot || ZERO32, ordersRoot: ordersRootOf(ops), fillsRoot: fillsRootOf(fills), bookHash });
-      if (myRoot !== batch.batchRoot) return { ok: false, why: `journal batch ${batch.index} no longer reproduces its root`, replayed: n };
+      const signed = rec.root || voted.get(Number(batch.index)) || batch.batchRoot;
+      if (myRoot !== signed) return { ok: false, why: `journal batch ${batch.index} no longer reproduces the root this miner signed`, replayed: n, dissented };
+      if (myRoot !== batch.batchRoot) dissented++;
       index = Number(batch.index); epoch = Number(batch.epoch); prevRoot = batch.batchRoot; offset = Number(rec.offset);
       if (bookHash !== ZERO32) lastBookHash = bookHash;
       n++; m.replayed++;
     }
-    return { ok: true, replayed: n };
+    return { ok: true, replayed: n, dissented };
   }
 
   // ------------------------------------------------------------- lifecycle
@@ -345,8 +353,13 @@ export function createMiner({
       state.close(); index = -1; epoch = 0; prevRoot = ZERO32; offset = -1; lastBookHash = ZERO32;
       state = newState();
     } else if (r.replayed) {
-      logFn(`[l3miner] ${shard}: replayed ${r.replayed} batch(es) from the journal → index ${index}, ${state.size} resting, book ${lastBookHash.slice(0, 12)}…`);
+      logFn(`[l3miner] ${shard}: replayed ${r.replayed} batch(es) from the journal${r.dissented ? ` (${r.dissented} this miner dissented on)` : ''} → index ${index}, ${state.size} resting, book ${lastBookHash.slice(0, 12)}…`);
     }
+    // what this miner sees as final resumes after what it replayed: the votes topic is re-read from its start (the
+    // quorum keys votes by miner), and a vote for a replayed batch — this miner's own dissent on one included — is
+    // history, not a fork to halt on again. Before, finality never advanced after a restart (batch 0 is never
+    // announced again, and finalIndex waited for it).
+    if (quorum) quorum.start(index + 1);
     const from = offset + 1;
     logFn(`[l3miner] up · shard ${shard} · miner ${account.address} · log ${log.kind} · ${v.workers} verify worker(s) · commitment ${state.commit.mode}${state.commit.tree ? ' (' + state.commit.impl + ')' : ''} · finality ${finalBook ? 'signed for ' + finalBook : 'NOT signed (no PREDICT_BOOK_L3)'} · from offset ${from}`);
     subOrders = await log.subscribe(orders, from, serial(handleBatch));
@@ -448,7 +461,7 @@ export function createMiner({
     return server;
   }
 
-  const api = { shard: String(shard), address: account.address, start, stop, status, serve, proveFill, state, quorum, rewards, verifier: v, finalBook,
+  const api = { shard: String(shard), address: account.address, start, stop, status, serve, proveFill, get state() { return state; }, quorum, rewards, verifier: v, finalBook,   // state: a getter — start() replaces it (a discarded journal, the native book)
                 get index() { return index; }, get epoch() { return epoch; }, get bookHash() { return lastBookHash; }, get stalled() { return stalled; },
                 get lastVote() { return lastVote; }, metrics: () => ({ ...m }) };
   return api;
