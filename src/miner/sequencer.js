@@ -211,6 +211,10 @@ export function createSequencer({
   /// `known`: the log's last record when the caller has already read the log (the rig replays the whole shard
   /// before resuming — see createSequencerRig's reconcile); undefined reads the tail here, null is an empty log
   async function resume(known = undefined) {
+    // The sequencer OWNS this topic, so it is the one that brings it into being: log.js made every reader pure, so
+    // that a retired shard's log stays deleted instead of being resurrected (empty, still holding the broker's
+    // per-topic floor) by the next miner that looks at it. A miner subscribing before this runs simply waits.
+    if (typeof log.ensureTopic === 'function') { try { await log.ensureTopic(topic); } catch { } }
     let last = known;
     if (last === undefined) {
       last = null;
@@ -451,23 +455,35 @@ export function createSequencerRig({
       s.booting = true;
       try {
         const impl = await ready();
-        // the log's own replay of the shard, then the chain's tail from it; the engine's books are reconciled
-        // with it — and renumbered as it — before the first new op is sequenced (see reconcile)
+        // the log's own replay of the shard: the chain's tail, and the book the miners hold — the engine's books are
+        // reconciled with it, and renumbered as it, before the first new op is sequenced (see reconcile)
         const shadow = await replayLog(impl, seq.topic, shard);
+        const tail = shadow.last && String(shadow.last.shard) === String(shard) ? Number(shadow.last.index) + 1 : 0;
+        // where finality resumes: the log's tail unless the caller still needs earlier batches (see resumeFrom) — the
+        // miner side does the same (quorum.start(index + 1) after its replay). Settled BEFORE the sequencer is resumed,
+        // so nothing can be sealed meanwhile: a batch announced before start() — the reconcile's own, sealed while a
+        // root's resumeFrom read the chain — kept the floor at -1 and finality waited for batch 0 for good, while the
+        // miners' votes for history, re-read from the votes topic, opened slots with no batch (deploy 83).
+        let from = tail;
+        if (resumeFrom) { try { const r = await resumeFrom(shard); if (r != null && Number.isFinite(Number(r))) from = Math.max(0, Math.min(from, Number(r))); } catch (e) { logFn(`[l3rig] resumeFrom(${shard}) failed: ${e.message}`); } }
+        const floor = quorum.start(from);
+        if (floor !== from - 1) logFn(`[l3rig] ${shard}: the quorum already ran (finalIndex ${floor}); its floor is not moved to ${from - 1}`);
+        if (from < tail) {
+          // offsets and indices coincide for a single-sequencer shard (one append per batch — see resume())
+          const rows = await impl.read(seq.topic, from, tail - from);
+          let n = 0; for (const { value } of rows) if (value && String(value.shard) === String(shard) && Number(value.index) >= from) { quorum.announce(value); n++; }
+          logFn(`[l3rig] ${shard}: re-announced ${n} batch(es) from index ${from} (log at ${tail}) for finality after restart`);
+        }
         await seq.resume(shadow.last);
         s.state.ops = shadow.state.seq;      // the shard's op counter continues the log's: every miner counts the same ops
         reconcile(s, shadow);
-        // where finality resumes: the log's tail unless the caller still needs earlier batches (see resumeFrom)
-        let from = seq.index;
-        if (resumeFrom) { try { const r = await resumeFrom(shard); if (r != null && Number.isFinite(Number(r))) from = Math.max(0, Math.min(from, Number(r))); } catch (e) { logFn(`[l3rig] resumeFrom(${shard}) failed: ${e.message}`); } }
-        quorum.start(from);
-        if (from < seq.index) {
-          // offsets and indices coincide for a single-sequencer shard (one append per batch — see resume())
-          const rows = await impl.read(seq.topic, from, seq.index - from);
-          let n = 0; for (const { value } of rows) if (value && String(value.shard) === String(shard) && Number(value.index) >= from) { quorum.announce(value); n++; }
-          logFn(`[l3rig] ${shard}: re-announced ${n} batch(es) from index ${from} (log at ${seq.index}) for finality after restart`);
-        }
-        s.sub = await impl.subscribe(votesTopic(shard), 0, async ({ value }) => { try { await quorum.vote(value); } catch (e) { logFn(`[l3rig] vote rejected: ${e.message}`); } });
+        // This shard OWNS its two topics, so it is the only thing that may create them: log.js made every reader
+        // pure, because a reader that creates on subscribe resurrects a topic that was deleted when its market
+        // resolved — empty, and still holding the broker's per-topic floor. The votes topic has no writer until a
+        // miner votes, so without this explicit create the subscribe below would find nothing on a fresh shard.
+        await impl.ensureTopic(seq.topic);
+        await impl.ensureTopic(votesTopic(shard));
+        s.sub = await impl.subscribe(votesTopic(shard), 0, async ({ value }) => { try { await quorum.vote(value); } catch (e) { logFn(`[l3rig] vote rejected: ${e.message}`); } }, { create: true });
         s.failedAt = 0;
       } catch (e) { logFn(`[l3rig] shard ${shard} not ready: ${e.message}`); s.failedAt = Date.now(); }
       finally { s.booting = false; }

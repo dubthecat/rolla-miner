@@ -42,12 +42,17 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
   const tails = new Set();    // live subscriptions
   let timer = null, closed = false;
 
-  function open(topic) {
+  // `create` false makes this a pure reader: a topic nobody has written does not come into being because someone
+  // looked at it. That is not a nicety — a shard's log is deleted when its market resolves and its quorum has
+  // finalised every index, and a reader that creates on open resurrects the topic (empty, still holding the
+  // broker's per-topic floor) the moment any miner sweeps it. See ensureTopic below: the shard's owner creates.
+  function open(topic, create = true) {
     const key = SAFE(topic); let t = topics.get(key);
     if (!t) {
       const file = path.join(dir, `${key}.jsonl`);
-      let count = 0, bytes = 0;
-      try { const buf = fs.readFileSync(file); bytes = buf.length; for (let i = 0; i < buf.length; i++) if (buf[i] === 10) count++; } catch {}
+      let count = 0, bytes = 0, found = false;
+      try { const buf = fs.readFileSync(file); bytes = buf.length; found = true; for (let i = 0; i < buf.length; i++) if (buf[i] === 10) count++; } catch {}
+      if (!found && !create) return null;
       t = { file, fd: fs.openSync(file, 'a'), count, bytes };
       topics.set(key, t);
     }
@@ -67,16 +72,21 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
 
   /// one tail: a byte position, a line counter and a serialised handler. `busy` guarantees the handler is never
   /// re-entered, so a slow miner simply reads later — it never sees two batches at once or out of order.
-  function makeTail(topic, fromOffset, handler) {
-    const t = open(topic);
-    return { topic, file: t.file, pos: 0, offset: 0, from: Math.max(0, fromOffset | 0), rest: '', busy: false, closed: false, handler, errors: 0 };
+  function makeTail(topic, fromOffset, handler, create = false) {
+    const t = open(topic, create);
+    // A topic that does not exist yet still gets a tail: it resolves its file on the first poll that finds one. That
+    // is what lets a reader WAIT without creating — the engine's quorum subscribes to a shard's votes topic before
+    // any miner has voted, and a dead handle there would starve finality for good.
+    const file = t ? t.file : path.join(dir, `${SAFE(topic)}.jsonl`);
+    return { topic, file, pos: 0, offset: 0, from: Math.max(0, fromOffset | 0), rest: '', busy: false, closed: false, handler, errors: 0, waiting: !t };
   }
   async function pump(tl) {
     if (tl.busy || tl.closed || closed) return;
     tl.busy = true;
     try {
       for (;;) {
-        let stat; try { stat = fs.statSync(tl.file); } catch { break; }
+        let stat; try { stat = fs.statSync(tl.file); } catch { break; }   // not there yet: a waiting tail just idles
+        if (tl.waiting) tl.waiting = false;
         if (stat.size <= tl.pos) break;
         const len = Math.min(stat.size - tl.pos, 1 << 20);
         const buf = Buffer.allocUnsafe(len);
@@ -102,10 +112,10 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
   return {
     kind: 'file', dir,
     async append(topic, msg) { return write(topic, [msg]); },
-    async appendMany(topic, msgs) { return msgs.length ? write(topic, msgs) : open(topic).count; },
-    async offset(topic) { return open(topic).count; },
+    async appendMany(topic, msgs) { return msgs.length ? write(topic, msgs) : (open(topic, false)?.count ?? 0); },
+    async offset(topic) { return open(topic, false)?.count ?? 0; },
     async read(topic, fromOffset = 0, limit = Infinity) {
-      const t = open(topic); const out = [];
+      const t = open(topic, false); const out = []; if (!t) return out;
       let buf; try { buf = fs.readFileSync(t.file, 'utf8'); } catch { return out; }
       let i = 0;
       for (const line of buf.split('\n')) {
@@ -117,12 +127,15 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
       }
       return out;
     },
-    async subscribe(topic, fromOffset, handler) {
-      const tl = makeTail(topic, fromOffset, handler);
+    exists(topic) { return !!open(topic, false); },
+    /// the shard's OWNER creates its topics, explicitly, once. Readers never do (see open).
+    async ensureTopic(topic) { open(topic, true); return true; },
+    async subscribe(topic, fromOffset, handler, { create = false } = {}) {
+      const tl = makeTail(topic, fromOffset, handler, create);
       tails.add(tl);
       if (!timer) { timer = setInterval(() => { for (const x of tails) pump(x); }, pollMs); timer.unref?.(); }
       await pump(tl);
-      return { close() { tl.closed = true; tails.delete(tl); if (!tails.size && timer) { clearInterval(timer); timer = null; } }, stats: () => ({ offset: tl.offset, errors: tl.errors }) };
+      return { waiting: !!tl.waiting, topic, close() { tl.closed = true; tails.delete(tl); if (!tails.size && timer) { clearInterval(timer); timer = null; } }, stats: () => ({ offset: tl.offset, errors: tl.errors, waiting: !!tl.waiting }) };
     },
     async close() {
       closed = true;
@@ -140,7 +153,7 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
 /// group, because every miner must see EVERY record, not a share of them (this is a replicated log, not a work
 /// queue; the earlier concept's `group.id: 'validators'` load-balanced orders across validators, which is
 /// exactly what must NOT happen here).
-export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPrefix = 'rolla-l3', ssl = undefined, sasl = undefined, logger = null, partitions = 1, replication = 1, acks = -1, connectionTimeout = 10000, retries = 2, readTimeoutMs = 15000 } = {}) {
+export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPrefix = 'rolla-l3', ssl = undefined, sasl = undefined, logger = null, partitions = 1, replication = 1, acks = -1, connectionTimeout = 10000, retries = 2, readTimeoutMs = 15000, pollWaitMs = 15000 } = {}) {
   const list = Array.isArray(brokers) ? brokers : String(brokers || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!list.length) throw new Error('KafkaLog needs L3_KAFKA_BROKERS');
   let Kafka, logLevel;
@@ -153,6 +166,13 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
   await producer.connect();
   const admin = kafka.admin(); await admin.connect();
   const known = new Set(); const consumers = new Set();
+  /// does the broker hold this topic? `known` is only ever a positive cache — a topic that is absent must be
+  /// re-checked, because the shard's owner may create it at any moment.
+  async function exists(topic) {
+    if (known.has(topic)) return true;
+    try { const list = await admin.listTopics(); if (list.includes(topic)) { known.add(topic); return true; } } catch { }
+    return false;
+  }
 
   /// one partition, always. If the topic exists with more, say so loudly rather than sequencing into ambiguity.
   async function ensure(topic) {
@@ -186,11 +206,15 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     kind: 'kafka', brokers: list,
     async append(topic, msg) { return send(topic, [msg]); },
     async appendMany(topic, msgs) { return msgs.length ? send(topic, msgs) : self.offset(topic); },
-    async offset(topic) {
-      await ensure(topic);
+    async offset(topic, { create = false } = {}) {
+      if (create) await ensure(topic);
+      else if (!(await exists(topic))) return 0;
       const o = await withLeader(`offsets ${topic}`, () => admin.fetchTopicOffsets(topic));
       return Number(o?.[0]?.high ?? 0);
     },
+    exists,
+    /// the shard's OWNER creates its topics, explicitly, once — readers never do
+    async ensureTopic(topic) { await ensure(topic); known.add(topic); return true; },
     /// watermark-driven: the records the topic holds NOW from `fromOffset` (at most `limit`), returned as soon as
     /// they are all in — not after a fixed window. A new consumer group's first rebalance can take seconds on a
     /// broker (group.initial.rebalance.delay), longer than the 3 s this used to wait: the sequencer's tail read
@@ -212,13 +236,35 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     },
     /// delete a topic (scratch topics of a check; never a shard's)
     async drop(topic) { known.delete(topic); await admin.deleteTopics({ topics: [topic] }); },
-    async subscribe(topic, fromOffset, handler) {
-      await ensure(topic);
+    /// `create` false makes this a pure reader. A shard's log is deleted once its market has resolved and its quorum
+    /// has finalised every index; a reader that creates on subscribe resurrects that topic — empty, and still holding
+    /// the broker's per-topic floor — the moment any miner sweeps it, which is why deleting them by hand never stuck.
+    /// kafkajs's consumer auto-creates too, so BOTH that flag and `ensure` have to go for a reader.
+    async subscribe(topic, fromOffset, handler, { create = false } = {}) {
+      if (create) await ensure(topic);
+      else if (!(await exists(topic))) {
+        // Wait for it rather than hand back a dead handle. A reader must not create the topic — that is what let a
+        // retired shard's log come back, empty and still holding the broker's per-topic floor — but it must also not
+        // give up: the engine's quorum subscribes to a shard's votes topic before any miner has voted, and a shard
+        // the sequencer boots a moment later would be stranded. The probe backs off to pollWaitMs, so a shard that
+        // is retired for good costs one cheap listTopics per interval and never comes back.
+        let wait = 250, timer = null, real = null, closed2 = false;
+        const tryAttach = async () => {
+          if (closed2) return;
+          try {
+            if (await exists(topic)) { real = await self.subscribe(topic, fromOffset, handler, { create: false }); if (closed2) real.close(); return; }
+          } catch { }
+          wait = Math.min(pollWaitMs, wait * 2);
+          timer = setTimeout(tryAttach, wait); timer.unref?.();
+        };
+        timer = setTimeout(tryAttach, wait); timer.unref?.();
+        return { waiting: true, topic, close() { closed2 = true; if (timer) clearTimeout(timer); if (real) real.close(); }, stats: () => (real ? real.stats() : { offset: -1, errors: 0, waiting: true }) };
+      }
       const groupId = `${groupPrefix}-${topic}-${Math.random().toString(36).slice(2, 10)}`;
       // a batch of 2,000 orders is ~1.2 MB; kafkajs's default fetch (1 MiB per partition) then carries ONE batch per
       // round trip, and a miner far from the broker pays that round trip per batch on top of its own work. Fetch
       // up to 16 MiB (8 MiB per partition, the broker's message limit) so one trip carries several batches.
-      const consumer = kafka.consumer({ groupId, sessionTimeout: 30000, allowAutoTopicCreation: true, maxBytesPerPartition: 8 << 20, maxBytes: 16 << 20, maxWaitTimeInMs: 50 });
+      const consumer = kafka.consumer({ groupId, sessionTimeout: 30000, allowAutoTopicCreation: !!create, maxBytesPerPartition: 8 << 20, maxBytes: 16 << 20, maxWaitTimeInMs: 50 });
       await consumer.connect();
       await withLeader(`subscribe ${topic}`, () => consumer.subscribe({ topic, fromBeginning: true }));
       let seeked = false;

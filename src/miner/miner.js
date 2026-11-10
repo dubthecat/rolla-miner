@@ -158,7 +158,7 @@ export function createMiner({
   if (dir) { fs.mkdirSync(dir, { recursive: true }); jBatches = path.join(dir, `${shard}.batches.jsonl`); jVotes = path.join(dir, `${shard}.votes.jsonl`); }
   const append = (file, rec) => { if (file) try { fs.appendFileSync(file, JSON.stringify(rec) + '\n'); } catch (e) { logFn(`[l3miner] journal append failed: ${e.message}`); } };
 
-  const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, commitMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0, voteFailures: 0, voteRetried: 0 };
+  const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, commitMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0, voteFailures: 0, voteRetried: 0, waitingForLog: false };
   let index = -1, epoch = 0, prevRoot = ZERO32, offset = -1, stalled = null, subOrders = null, subVotes = null, started = false, stopping = false;
   let lastVote = null, lastBookHash = ZERO32, inflight = Promise.resolve();
   const recent = new Map();                            // index → { batch, fills }, for challenge proofs
@@ -362,9 +362,20 @@ export function createMiner({
     if (quorum) quorum.start(index + 1);
     const from = offset + 1;
     logFn(`[l3miner] up · shard ${shard} · miner ${account.address} · log ${log.kind} · ${v.workers} verify worker(s) · commitment ${state.commit.mode}${state.commit.tree ? ' (' + state.commit.impl + ')' : ''} · finality ${finalBook ? 'signed for ' + finalBook : 'NOT signed (no PREDICT_BOOK_L3)'} · from offset ${from}`);
+    // A miner is a READER, so it never creates a topic. If the orders topic is gone the shard has been retired —
+    // its market resolved and its quorum finalised every index, so the sequencer dropped the log — and the honest
+    // response is to stop tracking it, not to recreate it. The old code let kafkajs auto-create, which is why
+    // deleting a dead shard's topics by hand never held: the next miner sweep brought them back empty, still
+    // holding the broker's per-topic floor.
+    // A miner is a READER of the orders topic and never creates it: creating on subscribe is what let a retired
+    // shard's log come back, empty and still holding the broker's per-topic floor, the moment any miner swept it.
+    // Waiting is the log's job now (log.js) — a subscription to a topic that does not exist yet attaches when it
+    // appears, so a shard the sequencer boots a moment later is picked up and one retired for good never fires.
     subOrders = await log.subscribe(orders, from, serial(handleBatch));
+    if (subOrders.waiting) { m.waitingForLog = true; logFn(`[l3miner] shard ${shard}: no log on the broker yet — waiting for it (a retired shard simply never appears)`); }
     // its OWN votes go in too: the agreeing set is what earns, so a miner that skipped itself could not account
-    // for its own µROLLA (rewards.js), and the quorum keys votes by miner so re-reading one is harmless
+    // for its own µROLLA (rewards.js), and the quorum keys votes by miner so re-reading one is harmless. A miner
+    // WRITES here, so its first vote creates the topic; the subscription attaches when that happens.
     if (quorum) subVotes = await log.subscribe(votes, 0, serial(async ({ value }) => { await quorum.vote(value); }));
     return api;
   }

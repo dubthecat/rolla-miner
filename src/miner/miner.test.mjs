@@ -639,7 +639,9 @@ async function reconcileScenario() {
   const bookFor = (outcome) => { const key = `${MARKET}:${outcome}`; let b = books.get(key); if (!b) { b = { key, market: MARKET, outcome, token, m: createBook() }; books.set(key, b); } return b; };
   const engineOrders = () => [...books.values()].flatMap((b) => b.m.orders());
   const hooks = { booksOf: () => [...books.values()], recOf: (hash) => orders.get(hash) || null, swapBook: (b, m) => { b.m = m; } };
-  const makeRig = () => createSequencerRig({ env, dir: path.join(dir, 'log'), account: operator, logger: () => {}, onFinal: () => {}, onFork: () => {}, ...hooks });
+  // resumeFrom as book.js's under a root: an async chain read, slower than batchMs — the reconcile's batch seals while it
+  // is awaited (deploy 83: every rebuilt shard's quorum stayed at finalIndex -1 while the miners finalized the batches)
+  const makeRig = () => createSequencerRig({ env, dir: path.join(dir, 'log'), account: operator, logger: () => {}, onFinal: () => {}, onFork: () => {}, resumeFrom: async () => { await new Promise((r) => setTimeout(r, 80)); return null; }, ...hooks });
   let n = 0;
   const signed = async (outcome, buy, cents) => {
     const o = l3OrderFor({ user: trader.address, marketId: MARKET, outcome, token, buy, price: BigInt(cents) * E / 100n, size: 2n * E, postOnly: true });
@@ -690,6 +692,7 @@ async function reconcileScenario() {
   assert.equal(rig.recordCancel(b0, r2, 'user', b0.m.cancel(r2.hash)), null, 'an op before the resume has no slot');
   assert.equal(rig.status().shards[SHARD].deferred, 1, 'the op was not deferred');
   assert.equal(await rig.prepare(b0), SHARD);
+  assert.equal(rig.shard(SHARD).quorum.finalIndex, 3, 'the quorum\'s floor is not the log tail after a rebuilt boot (deploy 83: -1 for good)');
   const st = rig.status();
   assert.equal(st.shards[SHARD].deferred, 0, 'the deferred op was not drained');
   const rc = st.shards[SHARD].reconcile;
@@ -722,6 +725,7 @@ async function reconcileScenario() {
   const q = rig.shard(SHARD).quorum;
   await finalAt(q, 5);
   assert.equal(q.halted, false); assert.equal(rig.status().shards[SHARD].quorum.forks, 0);
+  { const qs = q.status(); assert.equal(qs.pending.length, 0, `batches left pending on the engine side: ${JSON.stringify(qs.pending)}`); assert.ok(qs.stale >= 4, `the miner's votes for history (0..3) were not stale: ${qs.stale}`); }
 
   // ---- the miner's restart: a journal holding an honest dissent is its own history, not corruption ----
   await miner.stop();
