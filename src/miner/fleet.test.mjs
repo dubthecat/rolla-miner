@@ -183,3 +183,29 @@ test('the sweep is inert without a journal dir, and survives a dir that is not t
   assert.equal(r.removed, 0); assert.ok(r.error, 'it reports rather than throwing');
   await b.stop();
 });
+
+test('the sweep waits for the engine listing, and keeps a shard it is about to mine', async () => {
+  const dir = tmp('intent'); const jdir = path.join(dir, 'journal'); fs.mkdirSync(jdir, { recursive: true });
+  const old = Date.now() - 30 * 86400000;
+  const put = (name) => { const f = path.join(jdir, name); fs.writeFileSync(f, '{}\n'); fs.utimesSync(f, old / 1000, old / 1000); };
+  put('700.batches.jsonl'); put('800.batches.jsonl');
+  // an engine that lists 700 but is slow to answer: before the first poll nothing may be deleted, because the target
+  // set is unknown and 700's journal is about to be needed
+  let answer = null;
+  const fetchImpl = async () => { if (!answer) throw new Error('engine down'); return { ok: true, json: async () => answer }; };
+  const fleet = createFleet({
+    engineUrl: 'http://engine.invalid', pollMs: 0, address: '0x' + '33'.repeat(20), logger: () => {},
+    journalDir: jdir, journalRetainDays: 7, journalSweepMs: 0, fetchImpl,
+    newMiner: (shard) => ({ start: async () => {}, stop: async () => {}, status: () => ({ shard, ok: true, index: 0, stalled: null, voteFailures: 0, voteRetried: 0 }) }),
+  });
+  await fleet.start();
+  assert.equal(fleet.sweepJournals().removed, 0, 'no successful poll yet: nothing is judged');
+  assert.deepEqual(fs.readdirSync(jdir).sort(), ['700.batches.jsonl', '800.batches.jsonl']);
+  // now the engine answers with 700 only
+  answer = { markets: [{ id: 700, outcomes: 2 }] };
+  await fleet.reconcile();
+  const r = fleet.sweepJournals();
+  assert.equal(r.removed, 1, 'only the shard the engine does not list');
+  assert.deepEqual(fs.readdirSync(jdir), ['700.batches.jsonl'], '700 is kept because it is intended, started or not');
+  await fleet.stop();
+});

@@ -73,13 +73,21 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
   const jstats = { sweeps: 0, removed: 0, freedBytes: 0, kept: 0, lastAt: null, lastRemoved: 0, error: null };
   function sweepJournals() {
     if (!journalDir) return jstats;
+    // Judge by INTENT, not by what has started. `miners` fills in one shard at a time and a shard takes the better
+    // part of a minute to come up (its journal is replayed op by op), so on a fleet of 163 shards the first reconcile
+    // runs for hours — gating the sweep behind it, which is what I did first, means it effectively never runs. The
+    // engine's listing plus the static list is the set this fleet means to mine, and it is known as soon as the first
+    // poll returns. Until that poll succeeds the sweep does nothing: a half-known target would delete the journal of
+    // a shard that is about to be mined, which is the one mistake here that costs a log re-read.
+    if (url && !stats.lastPollOk) return jstats;
+    const keep = new Set([...fixed.map(String), ...(stats.listed || []).map(String), ...[...miners.keys()].map(String)]);
     const t0 = now(); const cutoff = t0 - Math.max(0, journalRetainDays) * 86400000;
     let removed = 0, freed = 0, kept = 0;
     try {
       for (const f of fs.readdirSync(journalDir)) {
         const m = /^(.+?)\.(batches|votes)\.jsonl(\..*)?$/.exec(f); if (!m) continue;
         const shard = m[1];
-        if (miners.has(shard)) { kept++; continue; }               // mined right now: its journal is live
+        if (keep.has(shard)) { kept++; continue; }                  // mined, or about to be: its journal is live
         const full = path.join(journalDir, f);
         let st; try { st = fs.statSync(full); } catch { continue; }
         if (st.mtimeMs > cutoff) { kept++; continue; }              // dropped only recently: it may be re-listed
@@ -153,10 +161,12 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
   async function start() {
     if (started) return api; started = true;
     logFn(`[l3fleet] up · ${fixed.length} static shard(s)${fixed.length ? ' (' + fixed.join(', ') + ')' : ''}${url ? ` · following ${url}/v1/l3/markets every ${Math.round(pollMs / 1000)} s` : ' · no engine to follow'}${byOutcome ? ' · shards by outcome' : ''}`);
+    // the sweep's own timer starts BEFORE the first reconcile, which can run for hours on a large fleet; it is
+    // self-guarding (it does nothing until the engine's listing is known) and judges by intent, not by what is up yet
+    if (journalDir && journalSweepMs > 0) { jtimer = setInterval(sweepJournals, journalSweepMs); jtimer.unref?.(); }
     await reconcile();
     if (url && pollMs > 0) { timer = setInterval(() => { reconcile(); }, pollMs); timer.unref?.(); }
-    // sweep after the first reconcile, so the shard set is known before anything is judged unmined
-    if (journalDir && journalSweepMs > 0) { sweepJournals(); jtimer = setInterval(sweepJournals, journalSweepMs); jtimer.unref?.(); }
+    if (journalDir) sweepJournals();
     return api;
   }
   async function stop() {
