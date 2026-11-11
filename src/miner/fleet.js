@@ -22,6 +22,8 @@
 // stalled miner, a dissent, or votes the log refuses is 503; an idle shard (no batch for an hour) is fine — the
 // engine simply has nothing to sequence there.
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 
 /// `L3_SHARDS=13805,13839` → ['13805', '13839'] (deduplicated, trimmed, in order)
 export const parseShards = (s) => [...new Set(String(s || '').split(',').map((x) => x.trim()).filter(Boolean))];
@@ -50,13 +52,46 @@ export function shardsOfMarkets(markets, { byOutcome = false } = {}) {
  *   fetchImpl        fetch (tests inject one)
  *   address          the miner's address, for /healthz and the metric labels
  */
-export function createFleet({ newMiner, static: staticShards = [], engineUrl = null, pollMs = 60000, byOutcome = false, fetchImpl = globalThis.fetch, logger: logFn = console.log, address = '', pollTimeoutMs = 15000 } = {}) {
+export function createFleet({ newMiner, static: staticShards = [], engineUrl = null, pollMs = 60000, byOutcome = false, fetchImpl = globalThis.fetch, logger: logFn = console.log, address = '', pollTimeoutMs = 15000, journalDir = null, journalRetainDays = 7, journalSweepMs = 6 * 3600000, now = Date.now } = {}) {
   if (typeof newMiner !== 'function') throw new Error('a fleet needs newMiner(shard)');
   const url = engineUrl ? String(engineUrl).replace(/\/+$/, '') : null;
   const fixed = parseShards(staticShards.join ? staticShards.join(',') : staticShards);
   const miners = new Map();       // shard → { miner, since, source: 'static' | 'engine' }
   const stats = { polls: 0, pollErrors: 0, lastPoll: 0, lastPollOk: 0, lastPollError: null, listed: [], started: 0, stopped: 0, startFailures: 0, reconciles: 0 };
-  let timer = null, stopping = false, started = false, chain = Promise.resolve(), ready = false;
+  // The journal sweep. A miner writes `<shard>.batches.jsonl` and `<shard>.votes.jsonl` for every shard it mines and
+  // nothing ever removed them: 458 files holding 958 MB on a 1 GB volume by 2026-11-11, oldest from 2026-10-04, and
+  // all three machines of the fleet at 100 % — so every journal append failed with ENOSPC and no miner could record
+  // what it had signed. A miner that restarts with no journal re-derives from the log instead of replaying, which is
+  // the slow path at best and impossible once the log's own 7-day retention has passed, and it is consistent with the
+  // 44 forks the engine was reporting.
+  //
+  // What makes a journal safe to delete is that nothing can ask for it again. It is read in exactly one place —
+  // replayJournal(), when a miner for THAT shard starts — so a shard the fleet does not mine has no reader. 394 of
+  // those 458 files, 798 MB of the 958 MB, belonged to shards whose markets had left the engine's snapshot entirely.
+  // The age test is the second half: a shard dropped and re-listed within the window keeps its journal and resumes by
+  // replay rather than re-reading the log.
+  const jstats = { sweeps: 0, removed: 0, freedBytes: 0, kept: 0, lastAt: null, lastRemoved: 0, error: null };
+  function sweepJournals() {
+    if (!journalDir) return jstats;
+    const t0 = now(); const cutoff = t0 - Math.max(0, journalRetainDays) * 86400000;
+    let removed = 0, freed = 0, kept = 0;
+    try {
+      for (const f of fs.readdirSync(journalDir)) {
+        const m = /^(.+?)\.(batches|votes)\.jsonl(\..*)?$/.exec(f); if (!m) continue;
+        const shard = m[1];
+        if (miners.has(shard)) { kept++; continue; }               // mined right now: its journal is live
+        const full = path.join(journalDir, f);
+        let st; try { st = fs.statSync(full); } catch { continue; }
+        if (st.mtimeMs > cutoff) { kept++; continue; }              // dropped only recently: it may be re-listed
+        try { fs.unlinkSync(full); removed++; freed += st.size; } catch { }
+      }
+    } catch (e) { jstats.error = e.message; logFn(`[l3fleet] journal sweep failed: ${e.message}`); return jstats; }
+    jstats.sweeps++; jstats.removed += removed; jstats.freedBytes += freed; jstats.kept = kept;
+    jstats.lastAt = new Date(t0).toISOString(); jstats.lastRemoved = removed;
+    if (removed) logFn(`[l3fleet] journal sweep: ${removed} file(s) of unmined shards older than ${journalRetainDays} d removed, ${Math.round(freed / 1e6)} MB freed, ${kept} kept`);
+    return jstats;
+  }
+  let timer = null, jtimer = null, stopping = false, started = false, chain = Promise.resolve(), ready = false;
 
   /// the shards wanted right now: the static list plus whatever the engine lists (or last listed, on a failed poll)
   async function wanted() {
@@ -120,11 +155,14 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
     logFn(`[l3fleet] up · ${fixed.length} static shard(s)${fixed.length ? ' (' + fixed.join(', ') + ')' : ''}${url ? ` · following ${url}/v1/l3/markets every ${Math.round(pollMs / 1000)} s` : ' · no engine to follow'}${byOutcome ? ' · shards by outcome' : ''}`);
     await reconcile();
     if (url && pollMs > 0) { timer = setInterval(() => { reconcile(); }, pollMs); timer.unref?.(); }
+    // sweep after the first reconcile, so the shard set is known before anything is judged unmined
+    if (journalDir && journalSweepMs > 0) { sweepJournals(); jtimer = setInterval(sweepJournals, journalSweepMs); jtimer.unref?.(); }
     return api;
   }
   async function stop() {
     stopping = true;
     if (timer) { clearInterval(timer); timer = null; }
+    if (jtimer) { clearInterval(jtimer); jtimer = null; }
     try { await chain; } catch {}
     for (const s of [...miners.keys()]) await stopShard(s, 'shutting down');
     if (server) { try { server.close(); } catch {} server = null; }
@@ -143,9 +181,12 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
     const shards = {}; let ok = ready;
     for (const [shard, e] of miners) { const st = shardStatus(shard, e); shards[shard] = st; if (!st.ok) ok = false; }
     return { ok, miner: address, shards, count: miners.size, static: fixed, engine: url ? { url, listed: stats.listed, lastPoll: stats.lastPoll, lastPollOk: stats.lastPollOk, polls: stats.polls, pollErrors: stats.pollErrors, lastPollError: stats.lastPollError, pollMs } : null,
-             started: stats.started, stopped: stats.stopped, startFailures: stats.startFailures, ready, uptime: process.uptime() };
+             started: stats.started, stopped: stats.stopped, startFailures: stats.startFailures, ready, uptime: process.uptime(),
+             journals: journalDir ? { dir: journalDir, retainDays: journalRetainDays, ...jstats } : null };
   }
   const healthy = () => status().ok;
+  /// run the journal sweep now (the timer calls it every journalSweepMs); returns its counters
+  const sweepNow = () => sweepJournals();
 
   /// Prometheus text: miner.js's series with a shard label, from each miner's status(), plus the fleet's own
   function metricsText() {
@@ -209,6 +250,6 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
     return server;
   }
 
-  const api = { start, stop, reconcile, status, healthy, metricsText, serve, shards: () => [...miners.keys()], minerOf: (s) => miners.get(String(s))?.miner || null, stats, get ready() { return ready; } };
+  const api = { start, stop, reconcile, status, healthy, metricsText, serve, shards: () => [...miners.keys()], minerOf: (s) => miners.get(String(s))?.miner || null, sweepJournals: sweepNow, stats, get ready() { return ready; } };
   return api;
 }

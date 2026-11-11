@@ -124,3 +124,62 @@ test('one fleet, two shards, real miners over a FileLog: each shard is replayed 
   // the journals are per shard, under one directory
   assert.ok(fs.existsSync(path.join(dir, 'journal', '41.batches.jsonl')) && fs.existsSync(path.join(dir, 'journal', '42.batches.jsonl')));
 });
+
+// ---- the journal sweep -----------------------------------------------------------------------------------------------
+// A miner journals every batch it signs and every vote it casts, per shard, and nothing ever removed those files: 458
+// of them holding 958 MB on a 1 GB volume by 2026-11-11, all three fleet machines at 100 %, so every append failed
+// with ENOSPC and no miner could record what it had signed. 798 MB of it belonged to shards whose markets had left
+// the engine's snapshot entirely.
+//
+// A journal is read in exactly one place — replayJournal(), when a miner for THAT shard starts — so a shard the fleet
+// does not mine has no reader. These pin that the sweep removes only those, and only once they are old.
+test('the journal sweep removes the journals of unmined shards, keeps the mined ones, and respects the age window', async () => {
+  const dir = tmp('sweep'); const jdir = path.join(dir, 'journal'); fs.mkdirSync(jdir, { recursive: true });
+  const old = Date.now() - 30 * 86400000, fresh = Date.now() - 60000;
+  const put = (name, when) => { const f = path.join(jdir, name); fs.writeFileSync(f, '{}\n'); fs.utimesSync(f, when / 1000, when / 1000); return f; };
+  // two shards the fleet mines, two it does not, one of those only just dropped, plus a corrupt spill-over
+  put('41.batches.jsonl', old); put('41.votes.jsonl', old);
+  put('42.batches.jsonl', old); put('42.votes.jsonl', old);
+  put('900.batches.jsonl', old); put('900.votes.jsonl', old);
+  put('901.batches.jsonl', fresh);
+  put('902.batches.jsonl.corrupt.123', old);
+  put('notajournal.txt', old);
+
+  const fleet = createFleet({
+    static: ['41', '42'], address: '0x' + '11'.repeat(20), logger: () => {},
+    journalDir: jdir, journalRetainDays: 7,
+    newMiner: (shard) => ({ start: async () => {}, stop: async () => {}, status: () => ({ shard, ok: true, index: 0, stalled: null, voteFailures: 0, voteRetried: 0 }) }),
+  });
+  await fleet.start();
+  const r = fleet.sweepJournals();
+  const left = fs.readdirSync(jdir).sort();
+  // mined shards keep theirs, however old
+  assert.ok(left.includes('41.batches.jsonl') && left.includes('41.votes.jsonl'), 'a mined shard keeps its journal');
+  assert.ok(left.includes('42.batches.jsonl'), 'and the second mined shard');
+  // an unmined, old shard loses both files, and its corrupt spill-over too
+  assert.equal(left.includes('900.batches.jsonl'), false);
+  assert.equal(left.includes('900.votes.jsonl'), false);
+  assert.equal(left.includes('902.batches.jsonl.corrupt.123'), false, 'a corrupt copy is journal data too');
+  // an unmined shard dropped only moments ago keeps its journal: it may be re-listed and resume by replay
+  assert.ok(left.includes('901.batches.jsonl'), 'inside the age window it is kept');
+  // and nothing that is not a journal is touched
+  assert.ok(left.includes('notajournal.txt'));
+  assert.equal(r.removed, 3); assert.ok(r.freedBytes > 0);
+  assert.equal(fleet.status().journals.removed, 3);
+  await fleet.stop();
+});
+
+test('the sweep is inert without a journal dir, and survives a dir that is not there', async () => {
+  const mk = (journalDir) => createFleet({
+    static: ['41'], address: '0x' + '22'.repeat(20), logger: () => {}, journalDir,
+    newMiner: (shard) => ({ start: async () => {}, stop: async () => {}, status: () => ({ shard, ok: true, index: 0, stalled: null, voteFailures: 0, voteRetried: 0 }) }),
+  });
+  const a = mk(null); await a.start();
+  assert.equal(a.status().journals, null, 'no dir, nothing reported');
+  assert.equal(a.sweepJournals().removed, 0);
+  await a.stop();
+  const b = mk(path.join(tmp('gone'), 'nope')); await b.start();
+  const r = b.sweepJournals();
+  assert.equal(r.removed, 0); assert.ok(r.error, 'it reports rather than throwing');
+  await b.stop();
+});

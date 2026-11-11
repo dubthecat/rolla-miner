@@ -164,6 +164,12 @@ const mainFleet = async () => {
   let theLog = null;
   const fleet = createFleet({
     static: fleetShards, engineUrl: engineUrl || null, pollMs, byOutcome, address: account.address, logger: (m) => log('info', String(m)),
+    // the journal dir, so the fleet can reclaim the journals of shards it no longer mines: nothing removed them and
+    // all three machines reached 100 % of a 1 GB volume, after which every append failed with ENOSPC and no miner
+    // could record what it had signed (L3_JOURNAL_RETAIN_DAYS, L3_JOURNAL_SWEEP_MS)
+    journalDir: dir || null,
+    journalRetainDays: Math.max(0, Number(env.L3_JOURNAL_RETAIN_DAYS ?? 7)),
+    journalSweepMs: Math.max(60000, Number(env.L3_JOURNAL_SWEEP_MS ?? 6 * 3600000)),
     newMiner: (s) => createMiner({ shard: s, log: theLog, account, domain, dir, grantOf, verifier, sequencers, threshold, bookL3, env, logger: (m) => log('info', String(m), { shard: String(s) }) }),
   });
   if (!/^0x[0-9a-fA-F]{40}$/.test(bookL3 || '')) log('warn', 'PREDICT_BOOK_L3 is unset: votes carry no finality signature, so this miner never counts towards an on-chain attestation');
