@@ -322,6 +322,17 @@ export function createMiner({
     for (const line of lines) {
       let rec; try { rec = JSON.parse(line); } catch { continue; }
       const batch = rec.batch; if (!batch || Number(batch.index) <= index) continue;
+      // The journal must begin at the shard's first batch. Replay rebuilds the book by applying every operation from
+      // the start, so a journal that has lost its HEAD replays from the middle onto an empty book and produces a
+      // state that is wrong in a way nothing downstream can see: the miner then computes a different batchRoot from
+      // the sequencer for every batch after it, dissents on each one, and halts its own shard's finality for good.
+      //
+      // That is not hypothetical. The fleet's volumes filled on 2026-11-11, every journal append failed with ENOSPC,
+      // and the miners came back replaying truncated journals: 2,811 forks across 8 halted shards, all of them
+      // `minerWhy: null`, which is the signature of a state divergence rather than a batch anyone thinks is invalid.
+      // The self-consistency check below cannot catch it, because the root a miner compares against is read from the
+      // same truncated journal, so a journal missing only its head agrees with itself perfectly.
+      if (index < 0 && Number(batch.index) !== 0) return { ok: false, why: `journal starts at batch ${batch.index}, not 0 — its head was lost, so replay would rebuild the wrong book`, replayed: n, dissented };
       if (index >= 0 && Number(batch.index) !== index + 1) return { ok: false, why: `journal skips ${index} → ${batch.index}`, replayed: n, dissented };
       const ops = Array.isArray(batch.ops) ? batch.ops : [];
       let fills = [];
