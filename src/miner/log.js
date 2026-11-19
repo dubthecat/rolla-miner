@@ -128,6 +128,9 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
       return out;
     },
     exists(topic) { return !!open(topic, false); },
+    async topics() { try { return fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).map((f) => f.slice(0, -6)); } catch { return []; } },
+    /// delete a topic: a shard's log, once its market has resolved and its quorum has finalised every index
+    async drop(topic) { const key = SAFE(topic); const t = topics.get(key); if (t) { try { fs.closeSync(t.fd); } catch { } topics.delete(key); } try { fs.unlinkSync(path.join(dir, `${key}.jsonl`)); } catch { } return true; },
     /// the shard's OWNER creates its topics, explicitly, once. Readers never do (see open).
     async ensureTopic(topic) { open(topic, true); return true; },
     async subscribe(topic, fromOffset, handler, { create = false } = {}) {
@@ -213,6 +216,8 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
       return Number(o?.[0]?.high ?? 0);
     },
     exists,
+    /// every topic the broker holds (the retirement sweep's input; '' on failure rather than a throw)
+    async topics() { try { return await admin.listTopics(); } catch { return []; } },
     /// the shard's OWNER creates its topics, explicitly, once — readers never do
     async ensureTopic(topic) { await ensure(topic); known.add(topic); return true; },
     /// watermark-driven: the records the topic holds NOW from `fromOffset` (at most `limit`), returned as soon as

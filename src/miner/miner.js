@@ -140,7 +140,11 @@ export function createMiner({
   if (!account?.address) throw new Error('a miner needs an account');
   const address = lower(account.address);
   const dom = domain || BOOK_DOMAIN(Number(env.CHAIN_ID || 46630), env.PREDICT_BOOK || '0x' + '00'.repeat(20));
-  const allowSeq = sequencers ? new Set([...sequencers].map(lower)) : null;
+  // An EMPTY allowlist means "any signer", not "nobody": run.mjs always passes an array (`L3_SEQUENCERS.split(',')`)
+  // and says so in its own warning, but `[]` is truthy, so an unset L3_SEQUENCERS built a Set that matches no
+  // address and every batch would stall its shard with "not signed by a known sequencer". Production sets the
+  // variable, so this never fired there — it was waiting for the first deployment that did not.
+  const allowSeq = sequencers && [...sequencers].length ? new Set([...sequencers].map(lower)) : null;
   // the finality domain: the same EIP-712 domain shape as the orders, on the RollaBookL3 address
   const finalBook = (() => { const b = bookL3 || env.PREDICT_BOOK_L3 || env.L3_BOOK_L3 || ''; return /^0x[0-9a-fA-F]{40}$/.test(b) ? b : null; })();
   const finalDomain = finalBook ? BOOK_DOMAIN(Number(dom.chainId), finalBook) : null;
@@ -156,7 +160,42 @@ export function createMiner({
 
   let jBatches = null, jVotes = null;
   if (dir) { fs.mkdirSync(dir, { recursive: true }); jBatches = path.join(dir, `${shard}.batches.jsonl`); jVotes = path.join(dir, `${shard}.votes.jsonl`); }
-  const append = (file, rec) => { if (file) try { fs.appendFileSync(file, JSON.stringify(rec) + '\n'); } catch (e) { logFn(`[l3miner] journal append failed: ${e.message}`); } };
+  // A journal grew without bound, and a hot shard shows what that costs: 19092's pair reached 78 MB and was still
+  // growing, while the fleet's 3 GB volumes sat at 100 % — after which every append failed with ENOSPC and the
+  // miners came back replaying truncated journals (2,811 forks across 8 halted shards).
+  // The cap is checked at a BATCH BOUNDARY, before the batch/vote pair is written, so the journal always ends on a
+  // complete pair; when it trips the journal is CLOSED FOR GOOD rather than rotated. That keeps its head, which is
+  // what makes it worth anything: replayJournal() refuses a journal that does not start at batch 0, so rotating
+  // would throw the whole thing away, while a frozen journal still rebuilds the book up to its last batch and
+  // `from = offset + 1` has the log supply the rest — the ordinary restart path, not a special one.
+  const JOURNAL_MAX = Number(env.L3_JOURNAL_MAX_BYTES || 16 * 1024 * 1024);
+  let jBytes = 0, jCapped = false;
+  if (jBatches) for (const f of [jBatches, jVotes]) { try { jBytes += fs.statSync(f).size; } catch { } }
+  const append = (file, rec) => { if (file) try { const line = JSON.stringify(rec) + '\n'; fs.appendFileSync(file, line); jBytes += Buffer.byteLength(line); } catch (e) { logFn(`[l3miner] journal append failed: ${e.message}`); } };
+  /// Set a journal aside after a failed replay, keeping ONE copy for forensics. Both halves move together: the
+  /// votes file is only a fallback for batch lines written before 2026-10-07 (they carry `root` themselves now), so
+  /// leaving it behind meant a shard that discarded its journal kept appending to a votes file nothing would read
+  /// again — 349 MB across 45 orphaned copies on one machine, two for each of the hot shards.
+  function discardJournal() {
+    if (!jBatches) return;
+    const stamp = Date.now();
+    for (const f of [jBatches, jVotes]) {
+      try { for (const old of fs.readdirSync(dir)) if (old.startsWith(`${path.basename(f)}.corrupt.`)) fs.unlinkSync(path.join(dir, old)); } catch { }
+      try { fs.renameSync(f, `${f}.corrupt.${stamp}`); } catch { }
+    }
+    jBytes = 0; jCapped = false;
+  }
+  /// may batch `next`'s pair be journalled? False once the shard's journal is full (or there is no journal at all).
+  const size = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${n} B`);
+  const journalRoom = (next) => {
+    if (!jBatches || jCapped) return false;
+    if (JOURNAL_MAX > 0 && jBytes >= JOURNAL_MAX) {
+      jCapped = true;
+      logFn(`[l3miner] ${shard}: journal is ${size(jBytes)} (L3_JOURNAL_MAX_BYTES ${size(JOURNAL_MAX)}) — closing it before batch ${next}; a restart replays what it holds and reads the rest from the log`);
+      return false;
+    }
+    return true;
+  };
 
   const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, commitMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0, voteFailures: 0, voteRetried: 0, waitingForLog: false };
   let index = -1, epoch = 0, prevRoot = ZERO32, offset = -1, stalled = null, subOrders = null, subVotes = null, started = false, stopping = false;
@@ -249,8 +288,10 @@ export function createMiner({
       if (ok) m.votes++;
       else { m.dissents++; logFn(`[l3miner] DISSENT on ${shard}#${mine.index}: ${why}${myRoot !== batch.batchRoot ? ` (mine ${myRoot.slice(0, 12)}…, theirs ${String(batch.batchRoot).slice(0, 12)}…)` : ' (the roots agree: the batch itself is invalid)'}`); }
 
-      append(jBatches, { offset: off, index: mine.index, epoch: mine.epoch, root: myRoot, ok, batch });   // the miner's own copy of the log, with the root IT signed
-      append(jVotes, vote);
+      if (journalRoom(mine.index)) {
+        append(jBatches, { offset: off, index: mine.index, epoch: mine.epoch, root: myRoot, ok, batch });   // the miner's own copy of the log, with the root IT signed
+        append(jVotes, vote);
+      }
       recent.set(mine.index, { batch, fills });
       if (recent.size > keepFills) { const oldest = Math.min(...recent.keys()); recent.delete(oldest); }
       lastVote = vote;
@@ -360,7 +401,7 @@ export function createMiner({
     const r = replayJournal();
     if (!r.ok) {
       logFn(`[l3miner] ${r.why} — discarding the local journal and replaying ${shard} from the log`);
-      try { fs.renameSync(jBatches, `${jBatches}.corrupt.${Date.now()}`); } catch {}
+      discardJournal();
       state.close(); index = -1; epoch = 0; prevRoot = ZERO32; offset = -1; lastBookHash = ZERO32;
       state = newState();
     } else if (r.replayed) {
@@ -410,6 +451,7 @@ export function createMiner({
       shard: String(shard), miner: account.address, log: log.kind, index, epoch, offset, stalled,
       resting: state.size, bookHash: lastBookHash, prevRoot, finalBook,
       lagSeconds: lagSeconds(), workers: v.workers, votesPending: votesPending.length + votesRetry.length, ...m,
+      journalBytes: jBytes, journalCapped: jCapped, journalMax: JOURNAL_MAX,
       perOrderMs: m.orders ? Number((m.verifyMs / m.orders).toFixed(3)) : 0,
       lastVote: lastVote ? { index: lastVote.index, ok: lastVote.ok, fillsRoot: lastVote.fillsRoot, batchRoot: lastVote.batchRoot } : null,
       quorum: quorum ? quorum.status() : null,

@@ -167,8 +167,12 @@ const mainFleet = async () => {
     // the journal dir, so the fleet can reclaim the journals of shards it no longer mines: nothing removed them and
     // all three machines reached 100 % of a 1 GB volume, after which every append failed with ENOSPC and no miner
     // could record what it had signed (L3_JOURNAL_RETAIN_DAYS, L3_JOURNAL_SWEEP_MS)
+    // Retention is 2 days, not the 7 it started at: the point of keeping a dropped shard's journal is that a shard
+    // re-listed soon after resumes by replay instead of re-reading the log, and the engine now drops a shard when
+    // its market RESOLVES, which it does not come back from. 7 days outlasted the disk — the volume refilled to
+    // 100 % before the window ever expired, which is the one outcome worse than a log re-read.
     journalDir: dir || null,
-    journalRetainDays: Math.max(0, Number(env.L3_JOURNAL_RETAIN_DAYS ?? 7)),
+    journalRetainDays: Math.max(0, Number(env.L3_JOURNAL_RETAIN_DAYS ?? 2)),
     journalSweepMs: Math.max(60000, Number(env.L3_JOURNAL_SWEEP_MS ?? 6 * 3600000)),
     newMiner: (s) => createMiner({ shard: s, log: theLog, account, domain, dir, grantOf, verifier, sequencers, threshold, bookL3, env, logger: (m) => log('info', String(m), { shard: String(s) }) }),
   });

@@ -273,7 +273,7 @@ export function createSequencer({
 export function createSequencerRig({
   env = process.env, dir = null, account = null, logger: logFn = console.log,
   onFinal = null, onFork = null, onEpoch = null, newBook = null, resumeFrom = null,
-  booksOf = null, recOf = null, swapBook = null,
+  booksOf = null, recOf = null, swapBook = null, retirableOf = null, now = Date.now,
 } = {}) {
   const acct = account || (env.OPERATOR_KEY ? privateKeyToAccount(env.OPERATOR_KEY.startsWith('0x') ? env.OPERATOR_KEY : '0x' + env.OPERATOR_KEY) : null);
   if (!acct) throw new Error('the L3 sequencer needs OPERATOR_KEY');
@@ -288,6 +288,97 @@ export function createSequencerRig({
   let logImpl = null, started = null, stopping = false;
   const stats = { finalized: 0, forks: 0, records: 0, skipped: 0, deferred: 0, reconciled: 0, unreconciled: 0, rebuilt: 0, epochsClosed: 0 };
   const PAGE = Math.max(1, Number(env.L3_RECONCILE_PAGE || 1000));
+
+  // ---------------------------------------------------------------- retirement
+  // The broker keeps `orders.<market>` and `votes.<market>` for every market the venue has ever sequenced and
+  // reclaimed neither: 2,045 topics and 26 GB by 2026-11-16. Each topic is a raft group, and on one node with four
+  // cores that crowd stopped being a storage bill and became an outage — 190 of 237 shards could not finish booting
+  // their sequencer, so every order on them was refused with "the L3 sequencer is not ready" and the board showed
+  // "no book yet" across most of it.
+  //
+  // A shard's log protects exactly one thing: the miners' ability to agree on a batch and, if challenged, to prove
+  // it. Once the market has resolved and the quorum has finalised every index there is no batch left to agree and no
+  // challenge left to serve, so the log has no remaining reader. Nothing on chain is touched by dropping it.
+  //
+  // `retirableOf(id)` is the engine's answer, read from the CHAIN rather than a cache, because the cache only holds
+  // the open markets plus the last 300 resolutions and a stale "I don't know this id" must never be read as "it is
+  // finished". Everything else here is a local proof, and every one of them must hold:
+  const RETIRE = String(env.L3_RETIRE ?? '1') === '1';
+  const RETIRE_MS = Math.max(60000, Number(env.L3_RETIRE_MS || 3600000));
+  const RETIRE_PER_RUN = Math.max(1, Number(env.L3_RETIRE_PER_RUN || 200));
+  const RETIRE_RETRY_MS = Math.max(50, Number(env.L3_RETIRE_RETRY_MS || 300000));   // after a sweep that could judge nothing
+  const RETIRE_RETRIES = Math.max(0, Number(env.L3_RETIRE_RETRIES || 6));            // how many such retries, so it cannot spin
+  const rstats = { runs: 0, retired: 0, dropped: 0, refused: 0, lastAt: null, lastRetired: 0, lastUnknown: 0, byWhy: {}, error: null };
+  const refuse = (why) => { rstats.refused++; rstats.byWhy[why] = (rstats.byWhy[why] || 0) + 1; return false; };
+  const marketOfShard = (shard) => Number(String(shard).split('-')[0]);
+
+  /// may this shard's log go? Every clause is a reason it may not, and the default is no.
+  function retirable(shard) {
+    const s = shards.get(shard);
+    if (!s) return true;                                              // not loaded this boot: judged by the chain alone
+    if (s.booting) return refuse('booting');
+    if (s.deferred.length) return refuse('ops not yet sequenced');
+    const q = s.quorum.status();
+    if (q.halted) return refuse('quorum halted');                     // a halted shard is the one case that still needs its log
+    if (Number(q.forks) > 0) return refuse('forks outstanding');
+    const head = Number(s.seq.index) - 1;                             // the last index handed out
+    if (head >= 0 && Number(q.finalIndex) < head) return refuse('tail not finalised');
+    if ((q.pending || []).length) return refuse('batches pending a vote');
+    return true;
+  }
+
+  /// retire one shard: stop it, then drop both of its topics. Stopping first is what makes it safe — a sequencer
+  /// still sealing into a topic that is about to vanish would hand out indices nobody can ever agree on.
+  async function retire(impl, shard) {
+    const s = shards.get(shard);
+    if (s) {
+      try { await s.seq.stop(); } catch { }
+      try { s.sub && (await s.sub.close()); } catch { }
+      try { s.state.close(); } catch { }
+      shards.delete(shard);
+    }
+    let dropped = 0;
+    for (const t of [ordersTopic(shard), votesTopic(shard)]) { try { await impl.drop(t); dropped++; } catch (e) { logFn(`[l3rig] ${shard}: drop ${t} failed: ${e.message}`); } }
+    rstats.retired++; rstats.dropped += dropped;
+    return dropped;
+  }
+
+  /// one pass: every topic the broker holds whose market the chain says is finished and whose local proof holds
+  async function sweepRetired() {
+    if (!RETIRE || typeof retirableOf !== 'function') return rstats;
+    // the log is opened on demand (boot), so a sweep that runs before the first order has to open it itself — this
+    // is also how the backlog is reached at all: on a fresh engine nothing has been sequenced yet
+    let impl = logImpl;
+    if (!impl) { try { impl = await ready(); } catch { return rstats; } }
+    if (!impl || typeof impl.topics !== 'function' || typeof impl.drop !== 'function') return rstats;
+    const t0 = now(); let retired = 0, unknown = 0;
+    try {
+      const seen = new Set();
+      for (const t of await impl.topics()) {
+        const m = /^(?:orders|votes)\.(.+)$/.exec(t); if (!m) continue;
+        seen.add(m[1]);
+      }
+      for (const shard of seen) {
+        if (retired >= RETIRE_PER_RUN) break;
+        const id = marketOfShard(shard); if (!Number.isFinite(id)) continue;
+        let ok = false;
+        try { ok = await retirableOf(id); } catch (e) { rstats.error = e.message; continue; }
+        if (ok == null) { unknown++; refuse('not known yet (the market cache is still loading)'); continue; }
+        if (!ok) { refuse('the chain says it is not finished'); continue; }
+        if (!retirable(shard)) continue;
+        await retire(impl, shard); retired++;
+      }
+    } catch (e) { rstats.error = e.message; logFn(`[l3rig] retirement sweep failed: ${e.message}`); }
+    rstats.runs++; rstats.lastAt = new Date(t0).toISOString(); rstats.lastRetired = retired; rstats.lastUnknown = unknown;
+    // A sweep that could not judge anything has not done its job, so it must not wait the full interval: the market
+    // cache needs minutes to load and the first sweep runs a minute after boot, which is how the first run refused
+    // every candidate and then slept for an hour.
+    // Bounded, because an unbounded retry spins: a permanently-unknown id used to re-arm this forever, 833 runs for
+    // 11 retirements. Only the first few sweeps after boot may retry, which is the window the cache actually needs.
+    if (unknown > 0 && retired === 0 && rstats.runs <= RETIRE_RETRIES) { setTimeout(() => { sweepRetired().catch(() => { }); }, RETIRE_RETRY_MS).unref?.(); }
+    if (retired) logFn(`[l3rig] retired ${retired} shard(s): their markets have resolved and their quorums finalised every index — ${rstats.dropped} topic(s) dropped in all`);
+    return rstats;
+  }
 
   /// the log's view of a shard: every batch replayed through the same state machine a miner runs (miner.js's
   /// createShardState, bookhash mode — the resting SET and the sequence counters are what matter here). What the
@@ -493,9 +584,27 @@ export function createSequencerRig({
     return s;
   }
 
+  // Armed at construction, NOT on the first order. It used to wait for prepare(), and that dependency is backwards:
+  // the sweep exists to clear a broker so crowded that shards cannot boot, and a shard that cannot boot is exactly
+  // the state in which no order gets far enough to arm anything. Cleanup must not depend on the traffic the mess is
+  // preventing. sweepRetired() opens the log itself, so it needs nothing from a shard.
+  let rtimer = null;
+  const armRetirement = () => {
+    if (rtimer || !RETIRE || typeof retirableOf !== 'function') return;
+    rtimer = setInterval(() => { sweepRetired().catch(() => { }); }, RETIRE_MS); rtimer.unref?.();
+    setTimeout(() => { sweepRetired().catch(() => { }); }, 60000).unref?.();
+  };
+
+  armRetirement();   // see the note above: not on the first order
   return {
     get log() { return logImpl; },
     threshold, ready,
+    /// run the retirement sweep now; its counters are in status().retirement
+    retire: () => sweepRetired(),
+    /// the live shard map, so a test can pin each clause of the retirement proof against a shard it controls
+    shardsForTest: () => shards,
+    /// arm the retirement timer (the constructor does this; exposed so a test can keep it off)
+    armRetirement,
     /// make the shard for this book exist and be resumed. The engine awaits this once per market, before its
     /// first order is matched, so no fill is ever matched into a shard that cannot tell it which batch it is in.
     async prepare(book) {
@@ -541,10 +650,12 @@ export function createSequencerRig({
     status() {
       const out = { log: logImpl ? logImpl.kind : logDown.at ? 'unavailable' : 'starting', logError: logDown.error, logAttempts: logDown.attempts, dir: logImpl?.dir || null, threshold, ...stats, shards: {} };
       for (const [k, s] of shards) out.shards[k] = { sequencer: s.seq.status(), quorum: s.quorum.status(), rewardsEpochClosed: s.closedEpoch, deferred: s.deferred.length, reconcile: s.reconcile };
+      out.retirement = { enabled: RETIRE && typeof retirableOf === 'function', everyMs: RETIRE_MS, perRun: RETIRE_PER_RUN, ...rstats };
       return out;
     },
     async stop() {
       stopping = true;
+      if (rtimer) { clearInterval(rtimer); rtimer = null; }
       for (const s of shards.values()) { try { await s.seq.stop(); } catch {} try { s.sub && (await s.sub.close()); } catch {} try { s.state.close(); } catch {} }
       shards.clear();
       if (logImpl) { try { await logImpl.close(); } catch {} }

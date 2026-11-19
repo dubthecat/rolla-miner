@@ -87,7 +87,11 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
       for (const f of fs.readdirSync(journalDir)) {
         const m = /^(.+?)\.(batches|votes)\.jsonl(\..*)?$/.exec(f); if (!m) continue;
         const shard = m[1];
-        if (keep.has(shard)) { kept++; continue; }                  // mined, or about to be: its journal is live
+        // A `.corrupt.` copy is a journal a miner set aside after a failed replay. Nothing ever reads one again, so
+        // it is judged on age alone — the mined/not-mined test does not protect it, and the hot shards each kept one
+        // of 78 MB on a 3 GB volume.
+        const forensic = /\.corrupt\./.test(f);
+        if (!forensic && keep.has(shard)) { kept++; continue; }     // mined, or about to be: its journal is live
         const full = path.join(journalDir, f);
         let st; try { st = fs.statSync(full); } catch { continue; }
         if (st.mtimeMs > cutoff) { kept++; continue; }              // dropped only recently: it may be re-listed
@@ -151,6 +155,12 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
       stats.reconciles++;
       const set = await wanted();
       if (stopping) return;
+      // Sweep BEFORE the first shard starts, not after the reconcile finishes. The post-reconcile sweep below is
+      // hours late on a large fleet — a shard takes the better part of a minute to replay its journal — and a miner
+      // whose volume is already full cannot append what it signs, which is how the last outage went: ENOSPC, then
+      // truncated journals, then 2,811 forks. The first successful poll is the earliest moment the keep set is
+      // known, and that is the moment the space is needed.
+      if (journalDir && !jstats.sweeps) sweepJournals();
       for (const s of set) if (!miners.has(s)) await startShard(s, fixed.includes(s) ? 'static' : 'engine');
       for (const s of [...miners.keys()]) if (!set.has(s)) await stopShard(s, 'no longer listed by the engine');
       ready = true;
