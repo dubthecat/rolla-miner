@@ -193,24 +193,48 @@ test('quorum: finality at the threshold, in order, and only for batches it has',
   assert.equal(q.status().forks, 0);
 });
 
-test('quorum: a dissent is a fork and halts finality', async () => {
+test('quorum: a dissent the quorum can outvote is absorbed; one that leaves it short is a fork', async () => {
+  // A single dissenting miner must not be able to stop the venue: absorbing one is what a 2-of-3 quorum IS. The old
+  // rule called fork() on the first dissent and halted at one fork, which handed any single miner a halt switch for
+  // any shard — and halted 9 live shards on 2026-11-19, because a miner that lost its journal re-reads the votes
+  // topic from offset 0 and every historical dissent arrived again as a fresh fork.
   const forks = [];
-  const q = createQuorum({ threshold: 2, verify: async (v) => v.miner, onFork: (f) => forks.push(f) });
+  const q = createQuorum({ threshold: 2, miners: ['0xa', '0xb', '0xc'], verify: async (v) => v.miner, onFork: (f) => forks.push(f) });
   const b0 = fakeBatch(0, ZERO32);
   q.announce(b0);
   await q.vote(voteFor('0xa', b0));
   const other = fakeBatch(0, ZERO32, 7).batchRoot;
   const r = await q.vote(voteFor('0xb', b0, other));
-  assert.equal(r.dissent, 1);
-  assert.equal(q.halted, true);
-  assert.equal(forks.length >= 1, true);
-  assert.equal(forks[0].why, 'a miner disagrees with the sequencer');
-  assert.equal(forks[0].miner, '0xb');
+  assert.equal(r.dissent, 1, 'the dissent is recorded');
+  assert.equal(q.halted, false, 'and absorbed: one of three can still be outvoted');
+  assert.deepEqual(forks, []);
+  // the evidence is kept whether or not a fork was raised — it is what the arbiter and a human both read
+  assert.equal(q.dissents().length, 1);
+  assert.equal(q.dissents()[0].miner, '0xb');
+  assert.equal(q.dissents()[0].got, other);
+  assert.equal(q.status().dissents, 1);
+  assert.equal(q.status().dissentsAbsorbed, 1);
   await q.vote(voteFor('0xc', b0));
-  assert.equal(q.finalIndex, -1, 'a halted quorum still advanced finality');
+  assert.equal(q.finalIndex, 0, 'the batch is final on the two miners that agree');
   assert.equal(q.at(0).agree.length, 2);
+  assert.deepEqual(q.at(0).dissent, ['0xb'], 'the dissenter is still named');
+
+  // the next batch: two of the three dissent, so no root can reach a threshold of two
+  const b1 = fakeBatch(1, b0.batchRoot);
+  q.announce(b1);
+  const wrong = fakeBatch(1, b0.batchRoot, 7).batchRoot;
+  await q.vote(voteFor('0xb', b1, wrong));
+  assert.equal(q.halted, false, 'one dissenter still leaves two that could agree');
+  await q.vote(voteFor('0xc', b1, wrong));
+  assert.equal(q.halted, true, 'two of three dissent: the threshold is out of reach');
+  assert.equal(forks.length, 1);
+  assert.match(forks[0].why, /1 miner\(s\) left to reach the threshold of 2/);
+  assert.equal(forks[0].index, 1);
+  // and a halt still holds finality back, exactly as before
+  await q.vote(voteFor('0xa', b1));
+  assert.equal(q.finalIndex, 0, 'a halted quorum advanced finality');
   q.resume({ forget: true });
-  assert.equal(q.finalIndex, 0, 'resume did not release the finalized batch');
+  assert.equal(q.finalIndex, 0, 'resume released a batch that never reached the threshold');
 });
 
 test('quorum: equivocation, a spliced chain and an unknown miner', async () => {
@@ -244,9 +268,11 @@ test('quorum: a vote that flags the batch does not count, even when its roots ma
   assert.equal(r.agree, 1);
   assert.equal(r.dissent, 1);
   assert.equal(q.finalIndex, -1, 'a flagged vote was counted towards finality');
-  assert.equal(q.forks()[0].why, 'a miner disagrees with the sequencer');
-  assert.equal(q.forks()[0].got, q.forks()[0].claimed, 'the roots were supposed to be identical here');
-  assert.equal(q.forks()[0].minerWhy, 'op 3: signature does not recover');   // the miner's reason, kept beside the condition
+  // no allowlist here, so "nobody else will vote" is unknowable and the dissent is absorbed rather than halting —
+  // but its evidence is kept, which is what the arbiter and a human both need
+  assert.deepEqual(q.forks(), []);
+  assert.equal(q.dissents()[0].got, q.dissents()[0].claimed, 'the roots were supposed to be identical here');
+  assert.equal(q.dissents()[0].minerWhy, 'op 3: signature does not recover');   // the miner's own reason
   assert.equal(q.at(0).dissent.length, 1);
   await q.vote(voteFor('0xc', b0));
   assert.equal(q.finalIndex, 0, 'two clean votes did not finalize it');
@@ -449,13 +475,17 @@ async function clusterScenario({ commit = 'bookhash', tag = 'cluster' } = {}) {
   assert.ok(tamperedAt >= 2 && tamperedAt < lastIndex, `nothing to tamper with (tampered at ${tamperedAt} of ${lastIndex})`);
   assert.equal(bad.metrics().dissents, 1, `the tampered miner dissented ${bad.metrics().dissents} times, not once (tampered batch ${tamperedAt})`);
   assert.equal(bad.lastVote.ok, true, 'the tamper leaked past its own batch');
-  const dis = observed.find((f) => f.index === tamperedAt && f.why === 'a miner disagrees with the sequencer');
-  assert.ok(dis, `no dissent fork was raised at ${tamperedAt}: ${JSON.stringify(observed.map((f) => [f.index, f.why]))}`);
+  // The tamperer is NAMED and earns nothing, and the venue keeps running: the honest three agreed, so the batch is
+  // final whatever the fourth says. Halting here would mean any one miner could stop a shard by voting wrong once.
+  const dis = observer.dissents().find((f) => f.index === tamperedAt);
+  assert.ok(dis, `the tamper was not recorded at ${tamperedAt}: ${JSON.stringify(observer.dissents().map((f) => f.index))}`);
   assert.equal(dis.miner, badAcct.address.toLowerCase());
   assert.notEqual(dis.got, dis.claimed);
-  assert.equal(observer.halted, true, 'the observer did not halt on the fork');
+  assert.deepEqual(observed, [], 'a dissent the quorum outvoted is not a fork');
+  assert.equal(observer.halted, false, 'one miner of four halted the shard');
   assert.equal(observer.at(tamperedAt).dissent.length, 1);
   assert.equal(observer.at(tamperedAt).agree.length, 3, 'the honest three were not still counted');
+  assert.equal(observer.at(tamperedAt).final, true, 'the batch the honest three agreed on is final');
   await bad.stop(); oOrders.close(); oVotes.close();
 
   // ---- a miner restarted from its journal catches up to the same book hash ----

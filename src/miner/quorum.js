@@ -10,7 +10,9 @@
 // One stuck batch stalls settlement behind it, by design.
 //
 // Five fork conditions, all detected without asking anyone (docs/L3-MINERS.md §3):
-//   * a vote's batchRoot differs from the sequencer's                       → dissent
+//   * a vote's batchRoot differs from the sequencer's                       → dissent (absorbed while the quorum
+//     can still reach `threshold` without it: that is what a quorum IS)
+//   * a dissent that leaves too few miners to reach the threshold           → fork
 //   * two miners disagree with each other                                  → fork
 //   * one miner votes twice for one index with different roots              → equivocation; its votes stop counting
 //   * a batch's prevRoot is not the previous batch's batchRoot              → the log was spliced or rewritten
@@ -29,7 +31,11 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
   const batches = new Map();        // index → { batch, root, votes: Map<miner, vote>, agree: Set, dissent: Map, final, announced }
   const equivocators = new Set();
   const forks = [];
-  const stats = { batches: 0, votes: 0, dissents: 0, stale: 0, unknown: 0, bad: 0, finalized: 0 };
+  // Absorbed dissents: a dissent the quorum outvoted raises no fork, but its evidence is exactly what an arbiter
+  // needs later and what a human reads to tell a lying miner from a broken book (`minerWhy: null` is the signature
+  // of a state divergence rather than a batch anyone believes is invalid). Newest last, bounded.
+  const dissentLog = [];
+  const stats = { batches: 0, votes: 0, dissents: 0, dissentsAbsorbed: 0, stale: 0, unknown: 0, bad: 0, finalized: 0 };
   let finalIndex = -1, head = -1, halted = false, prevRoot = ZERO32, prevIndex = -1;
 
   const recover = verify || (async (v) => recoverDigestSigner(voteDigestOf(v), v.sig));
@@ -87,12 +93,31 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     // matters: a batch whose order signature is forged hashes to the SAME roots (the ops are what they are), so
     // a miner that caught it would otherwise be counted towards finality for the batch it just refused.
     if (v.batchRoot === s.root && v.ok !== false) { s.dissent.delete(miner); s.agree.add(miner); }
-    else { s.agree.delete(miner); if (!s.dissent.has(miner)) { s.dissent.set(miner, v); stats.dissents++; fork(s.index, 'a miner disagrees with the sequencer', { miner, claimed: s.root, got: v.batchRoot, minerWhy: v.why || null, fillsRoot: v.fillsRoot, ordersRoot: v.ordersRoot }); } }
-    // two miners that disagree with each other, both having voted
-    // the miners' OWN roots, dissents included: more than one value means they disagree with each other, which is a
-    // different (and worse) story than all of them disagreeing with the sequencer. A dissent whose root matches —
-    // the forged-signature case — leaves this set at one, so it raises only the dissent above.
-    const roots = new Set([...s.votes.values()].filter((x) => !equivocators.has(x.miner)).map((x) => x.batchRoot));
+    else if (!s.dissent.has(miner)) {
+      s.agree.delete(miner); s.dissent.set(miner, v); stats.dissents++;
+      // A single dissent is a DISSENT, not a fork. The header above has always drawn that line and the code did not:
+      // it called fork() on the first one, and with haltAfter 1 that halted the shard — over a vote the quorum was
+      // built to absorb. With threshold 2 of 3 miners, one miner disagreeing is exactly the case a quorum exists for.
+      // It is also what kept 9 shards halted after the fleet's volumes filled on 2026-11-11. A miner that lost its
+      // journal re-reads the log from the beginning, and its quorum re-reads the votes topic from offset 0 (it always
+      // does — votes are keyed by miner, so re-reading one is harmless), so every historical dissent arrived again as
+      // a fresh fork and stopped finality on batches that HAD reached the threshold months of batches ago.
+      // A dissent becomes a halt only when too few miners are left for the batch to reach the threshold at all. The
+      // miners contradicting EACH OTHER is the separate, worse condition checked below, and it still halts at once.
+      const ev = { miner, claimed: s.root, got: v.batchRoot, minerWhy: v.why || null, fillsRoot: v.fillsRoot, ordersRoot: v.ordersRoot };
+      const left = allow ? allow.size - s.dissent.size : Infinity;   // with no allowlist, "nobody else will vote" is unknowable
+      if (s.agree.size < threshold && left < threshold) fork(s.index, `only ${Math.max(0, left)} miner(s) left to reach the threshold of ${threshold}`, ev);
+      else { stats.dissentsAbsorbed++; dissentLog.push({ ...ev, index: s.index, at: Date.now() }); if (dissentLog.length > 64) dissentLog.shift(); logger && logger(`[l3quorum] dissent at ${s.index} from ${String(miner).slice(0, 10)}…: ${v.why || 'roots differ from the sequencer'} — ${s.agree.size >= threshold ? 'the batch is final anyway' : `the quorum can still reach ${threshold}`}`); }
+    }
+    // Two miners that disagree with EACH OTHER, which is a different and worse story than one disagreeing with the
+    // sequencer: at least two books are wrong, or two miners are lying, and no amount of waiting fixes either.
+    // The set is the DISSENTERS' roots. It used to be every vote's root — and an agreeing miner's root is the
+    // sequencer's by definition, so a single dissent always made this set two values and always raised a fork. That
+    // is how one miner could halt any shard it liked, and how a historical dissent re-read from the votes topic
+    // halted a shard whose batches had reached the threshold long before. A dissent whose root matches the
+    // sequencer's — the forged-signature case, where the miner flagged the batch rather than computing it
+    // differently — leaves this set at one value, as it always did.
+    const roots = new Set([...s.dissent.values()].filter((x) => !equivocators.has(x.miner)).map((x) => x.batchRoot));
     if (roots.size > 1 && !forks.some((f) => f.index === s.index && f.why === 'miners disagree with each other')) fork(s.index, 'miners disagree with each other', { roots: [...roots] });
   }
 
@@ -164,6 +189,8 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     /// a batch's standing, for /v1/l3/status and the miner's /metrics
     at(index) { const s = batches.get(Number(index)); return s ? { index: s.index, root: s.root, final: s.final, agree: [...s.agree], dissent: [...s.dissent.keys()], votes: s.votes.size } : null; },
     forks: () => forks.slice(-32),
+    /// dissents the quorum absorbed (no fork raised): the same evidence shape as a fork
+    dissents: () => dissentLog.slice(-32),
     rewards,
     /**
      * judge a fork, off chain for now (docs/L3-MINERS.md §9.2 wants an on-chain arbiter). The evidence is already

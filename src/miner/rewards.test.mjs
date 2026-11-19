@@ -155,9 +155,12 @@ test('the quorum pays only the agreeing set, and judging a fork pays the dissent
   q.announce(b1);
   await q.vote(vote(A, b1, 5)); await q.vote(vote(B, b1, 5));
   await q.vote(vote(C, b1, 5, fake(1, b0.batchRoot, 9).batchRoot));
-  // two distinct conditions fire on one dissent: "a miner disagrees with the sequencer" and, because the vote
-  // set now holds two roots, "miners disagree with each other"
-  assert.deepEqual(q.forks().map((f) => f.why), ['a miner disagrees with the sequencer', 'miners disagree with each other']);
+  // No fork: A and B already met the threshold, so C's dissent is absorbed — one miner disagreeing is what a quorum
+  // exists to absorb, and the two conditions that DO halt (the dissenters contradicting each other, or too few
+  // miners left to reach the threshold) are neither of them here. The arbiter path must not depend on a fork having
+  // been raised, which is what `judge` below proves: the evidence is the votes themselves.
+  assert.deepEqual(q.forks(), []);
+  assert.deepEqual(q.dissents().map((f) => [f.index, f.miner]), [[1, C]]);
   assert.equal(q.status().rewards.accrued[A], '225');             // 120 + 105
   const judged = q.judge(1, { dissenterWasRight: true });
   assert.equal(judged.paid[0].miner, C);
