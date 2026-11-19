@@ -69,5 +69,11 @@ test('throughput: in-process orders per second on one thread', () => {
   const book = createBook(); const N = 200000;
   const t0 = process.hrtime.bigint(); const out = run(11, N, book); const dt = Number(process.hrtime.bigint() - t0) / 1e9;
   console.log(`  matcher: ${N} ops in ${dt.toFixed(2)} s → ${Math.round(N / dt).toLocaleString()} ops/s · ${out.length} fills+cancels · ${book.size} resting`);
-  assert.ok(N / dt > 50000, `too slow: ${Math.round(N / dt)} ops/s`);
+  // The number above is the one to read; this floor only catches an ORDER-OF-MAGNITUDE regression. It was 50,000,
+  // which this matcher clears with room on an idle machine (87,500 when it was written) and does not while the box
+  // is busy — 47,236 and 36,650 on two loaded runs — so the gate failed over machine load on code nobody had
+  // touched, which is the one thing a performance gate must not do: a test that cries wolf stops being read.
+  // `L3_MATCHER_MIN_OPS` raises it for a quiet machine or CI.
+  const floor = Number(process.env.L3_MATCHER_MIN_OPS || 20000);
+  assert.ok(N / dt > floor, `too slow: ${Math.round(N / dt)} ops/s, under the ${floor.toLocaleString()} floor`);
 });

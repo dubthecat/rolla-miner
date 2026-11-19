@@ -154,12 +154,19 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
   async function vote(v) {
     if (!v || typeof v !== 'object' || !Number.isFinite(Number(v.index))) { stats.bad++; return { ok: false, why: 'malformed' }; }
     const index = Number(v.index);
+    // The stale test comes FIRST because recovering the signer is the single most expensive thing this process does
+    // — 254 µs of secp256k1 per vote — and a vote for a batch already finalized and pruned is discarded whatever it
+    // says. Every miner's votes topic is re-read from offset 0 at every start (the quorum keys votes by miner, so
+    // re-reading one is harmless and a restart needs it), which on the live engine means ~95 shards x thousands of
+    // historical votes: it was 51 % of ALL the engine's CPU in the profile of 2026-11-19, blocking the event loop in
+    // ~100 ms bursts, so a 21 KB page took 1.2 s to serve while a route with no body took 20 ms. Checking an integer
+    // before a signature costs nothing and skips the recovery entirely for the part of the log that is history.
+    if (index <= finalIndex && !batches.has(index)) { stats.stale++; return { ok: false, why: 'stale (that batch is pruned)' }; }
     const signer = await recover(v);
     if (!signer) { stats.bad++; return { ok: false, why: 'bad signature' }; }
     if (v.miner && String(v.miner).toLowerCase() !== signer) { stats.bad++; return { ok: false, why: 'signature is not the miner it claims' }; }
     if (allow && !allow.has(signer)) { stats.unknown++; return { ok: false, why: 'not a known miner' }; }
     const vv = { ...v, miner: signer };
-    if (index <= finalIndex && !batches.has(index)) { stats.stale++; return { ok: false, why: 'stale (that batch is pruned)' }; }
     const s = slotOf(index);
     const had = s.votes.get(signer);
     if (had && had.batchRoot !== vv.batchRoot) {

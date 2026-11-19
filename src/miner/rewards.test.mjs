@@ -222,3 +222,31 @@ test('a fork resolves when its batch later reaches the threshold; equivocation n
   assert.equal(q3.forks()[0].sticky, true);
   assert.deepEqual(q3.resolvedForks(), [], 'provable misbehaviour is never resolved by a later vote');
 });
+
+test('a stale vote costs an integer compare, not a signature recovery', async () => {
+  // Recovering the signer is the single most expensive thing this process does — 254 µs of secp256k1 — and every
+  // miner's votes topic is re-read from offset 0 at every start (the quorum keys votes by miner, so re-reading one
+  // is harmless and a restart needs it). The engine sets a real finality floor on resume (`quorum.start(tail)`),
+  // so almost all of that log is history; the stale test just sat BEHIND the recovery, so each historical vote was
+  // fully verified and then thrown away. On the live engine that was 51 % of ALL its CPU across ~95 shards,
+  // blocking the event loop in ~100 ms bursts: a 21 KB page took 1.2 s to serve while a route with no body took 20.
+  let recoveries = 0;
+  const q = createQuorum({ threshold: 2, verify: async (v) => { recoveries++; return v.miner; } });
+  q.start(500);                                      // the log's tail after a restart: everything below is settled
+  assert.equal(q.finalIndex, 499);
+  const old = fake(12, ZERO32);
+  assert.deepEqual(await q.vote(vote(A, old, 1)), { ok: false, why: 'stale (that batch is pruned)' });
+  assert.equal(recoveries, 0, 'the history of the log is skipped without a single recovery');
+  assert.equal(q.status().stale, 1);
+  // a vote at the live head is verified as it always was
+  const live = fake(500, ZERO32);
+  q.announce(live);
+  await q.vote(vote(A, live, 1));
+  assert.equal(recoveries, 1);
+  // and so is a late vote for a batch still held in memory, finalized or not
+  await q.vote(vote(B, live, 1));
+  assert.equal(recoveries, 2);
+  assert.equal(q.finalIndex, 500);
+  await q.vote(vote(C, live, 1));
+  assert.equal(recoveries, 3, 'a batch still in `batches` is never stale, even below finalIndex');
+});
