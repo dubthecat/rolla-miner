@@ -170,3 +170,55 @@ test('the quorum pays only the agreeing set, and judging a fork pays the dissent
   assert.equal(q.judge(1, { dissenterWasRight: true }), null);
   assert.ok(q.status().rewards.epochs.length === 0, 'the quorum closed an epoch by itself');
 });
+
+test('a fork resolves when its batch later reaches the threshold; equivocation never does', async () => {
+  // This is what a restart needs. A miner whose journal is gone re-reads the orders log from the beginning and its
+  // quorum re-reads the votes topic from offset 0, so an outage's historical dissents all arrive again — in
+  // arbitrary order. The dissent for index i can land BEFORE the two agreements that make i final, so the fork is
+  // raised, and being sticky it halted the shard for good: on 2026-11-19 four of miner-1's six shards sat halted at
+  // `finalIndex -1` while 7,709 of their 8,116 votes agreed and no miner was currently disagreeing.
+  const q = createQuorum({ threshold: 2, verify: async (v) => v.miner, miners: [A, B, C] });
+  const b0 = fake(0, ZERO32);
+  q.announce(b0);
+  // two dissenters, holding DIFFERENT wrong roots, arrive first: that is a real fork and it halts
+  await q.vote(vote(B, b0, 1, fake(0, ZERO32, 8).batchRoot));
+  await q.vote(vote(C, b0, 1, fake(0, ZERO32, 9).batchRoot));
+  assert.equal(q.halted, true);
+  assert.equal(q.forks().length >= 1, true);
+  // then the agreements that settle it. With B and C dissenting there is only one miner left, so finality still
+  // cannot be reached here — the fork stands, which is correct.
+  await q.vote(vote(A, b0, 1));
+  assert.equal(q.halted, true, 'one agreeing miner of three is not a quorum');
+
+  // the next batch: the dissents land first, the agreements after — the replay order that caused the outage. Four
+  // miners here, so two can still reach a threshold of two after two have dissented.
+  const D = '0xd';
+  const q2 = createQuorum({ threshold: 2, verify: async (v) => v.miner, miners: [A, B, C, D] });
+  const b1 = fake(0, ZERO32);
+  q2.announce(b1);
+  await q2.vote(vote(C, b1, 1, fake(0, ZERO32, 9).batchRoot));
+  await q2.vote(vote(B, b1, 1, fake(0, ZERO32, 8).batchRoot));
+  assert.equal(q2.halted, true, 'two miners holding two different roots is a fork');
+  await q2.vote(vote(A, b1, 1));
+  assert.equal(q2.halted, true, 'still only one agreeing');
+  // the fourth miner agrees: now the sequencer's root has the threshold and the dispute is settled
+  await q2.vote(vote(D, b1, 1));
+  assert.equal(q2.finalIndex, 0, 'the batch is final on the two that agree');
+  assert.equal(q2.halted, false, 'and the fork it raised is resolved');
+  assert.deepEqual(q2.forks(), []);
+  assert.equal(q2.resolvedForks().length >= 1, true, 'kept for the record');
+
+  // equivocation is never resolved this way: that miner has provably misbehaved whatever the set decides
+  const q3 = createQuorum({ threshold: 2, verify: async (v) => v.miner, miners: [A, B, C] });
+  const b2 = fake(0, ZERO32);
+  q3.announce(b2);
+  await q3.vote(vote(C, b2, 1));
+  await q3.vote(vote(C, b2, 1, fake(0, ZERO32, 7).batchRoot));   // the same miner, a second root
+  assert.equal(q3.halted, true);
+  await q3.vote(vote(A, b2, 1)); await q3.vote(vote(B, b2, 1));
+  assert.equal(q3.at(0).final, true, 'the honest two do agree on the batch');
+  assert.equal(q3.halted, true, 'but the equivocation stands, and a halt holds finality back');
+  assert.equal(q3.finalIndex, -1, 'nothing settles behind an unresolved dispute — that is the point of halting');
+  assert.equal(q3.forks()[0].sticky, true);
+  assert.deepEqual(q3.resolvedForks(), [], 'provable misbehaviour is never resolved by a later vote');
+});

@@ -35,7 +35,8 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
   // needs later and what a human reads to tell a lying miner from a broken book (`minerWhy: null` is the signature
   // of a state divergence rather than a batch anyone believes is invalid). Newest last, bounded.
   const dissentLog = [];
-  const stats = { batches: 0, votes: 0, dissents: 0, dissentsAbsorbed: 0, stale: 0, unknown: 0, bad: 0, finalized: 0 };
+  const resolved = [];              // forks a later quorum settled, newest last, bounded
+  const stats = { batches: 0, votes: 0, dissents: 0, dissentsAbsorbed: 0, stale: 0, unknown: 0, bad: 0, finalized: 0, forksResolved: 0 };
   let finalIndex = -1, head = -1, halted = false, prevRoot = ZERO32, prevIndex = -1;
 
   const recover = verify || (async (v) => recoverDigestSigner(voteDigestOf(v), v.sig));
@@ -51,6 +52,32 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     onFork && onFork(f);
     if (forks.length >= haltAfter) halted = true;
     return f;
+  }
+  /// A fork at a batch that LATER reaches the threshold is RESOLVED: the quorum itself has decided it, and holding
+  /// finality behind a dispute the miners have settled is worse than useless.
+  ///
+  /// This is what a restart needs. A miner whose journal is gone re-reads the orders log from the beginning and its
+  /// quorum re-reads the votes topic from offset 0, so an outage's historical dissents all arrive again — in
+  /// arbitrary order. The dissent for index i can land before the two agreements that make i final, so the fork is
+  /// raised, and being sticky it halted the shard for good: on 2026-11-19, four of miner-1's six shards sat halted
+  /// with `finalIndex -1` while 7,709 of their 8,116 votes agreed and no miner was currently disagreeing.
+  ///
+  /// Equivocation is never resolved this way (`sticky`): a miner that signed two different roots for one index has
+  /// provably misbehaved whatever the rest of the set decides, and that evidence is the arbiter's.
+  function resolveForks(index) {
+    if (!forks.length) return;
+    let moved = 0;
+    for (let i = forks.length - 1; i >= 0; i--) {
+      const f = forks[i];
+      if (Number(f.index) !== Number(index) || f.sticky) continue;
+      resolved.push({ ...f, resolvedAt: Date.now() }); if (resolved.length > 64) resolved.shift();
+      forks.splice(i, 1); moved++;
+    }
+    if (!moved) return;
+    stats.forksResolved += moved;
+    const was = halted;
+    halted = forks.length >= haltAfter;
+    logger && logger(`[l3quorum] batch ${index} reached the threshold: ${moved} fork(s) resolved, ${forks.length} left${was && !halted ? ' — no longer halted' : ''}`);
   }
   /// drop finalized history we no longer need, oldest first (a miner's late vote for a pruned batch is 'stale')
   function prune() {
@@ -118,7 +145,9 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     // sequencer's — the forged-signature case, where the miner flagged the batch rather than computing it
     // differently — leaves this set at one value, as it always did.
     const roots = new Set([...s.dissent.values()].filter((x) => !equivocators.has(x.miner)).map((x) => x.batchRoot));
-    if (roots.size > 1 && !forks.some((f) => f.index === s.index && f.why === 'miners disagree with each other')) fork(s.index, 'miners disagree with each other', { roots: [...roots] });
+    // and not on a batch the quorum has ALREADY decided: `threshold` miners holding the sequencer's root is finality,
+    // whatever the dissenters hold between them. Raising it anyway is how a restart halted shards whose miners agree.
+    if (roots.size > 1 && s.agree.size < threshold && !forks.some((f) => f.index === s.index && f.why === 'miners disagree with each other')) fork(s.index, 'miners disagree with each other', { roots: [...roots] });
   }
 
   /// one signed vote. Returns { ok, why?, final?, agree?, dissent? }.
@@ -135,7 +164,7 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     const had = s.votes.get(signer);
     if (had && had.batchRoot !== vv.batchRoot) {
       equivocators.add(signer); s.agree.delete(signer);
-      fork(index, 'a miner signed two different roots for one batch (equivocation)', { miner: signer, a: had, b: vv });
+      fork(index, 'a miner signed two different roots for one batch (equivocation)', { miner: signer, a: had, b: vv, sticky: true });
       return { ok: false, why: 'equivocation', evidence: [had, vv] };
     }
     s.votes.set(signer, vv); stats.votes++;
@@ -159,7 +188,7 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
 
   /// advance finality through contiguous finalized batches, firing onFinal in order
   function settleFinality() {
-    for (const s of batches.values()) if (!s.final && s.batch && s.agree.size >= threshold) { s.final = true; stats.finalized++; }
+    for (const s of batches.values()) if (!s.final && s.batch && s.agree.size >= threshold) { s.final = true; stats.finalized++; resolveForks(s.index); }
     if (halted) return;
     for (;;) {
       const next = batches.get(finalIndex + 1);
@@ -191,6 +220,8 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     forks: () => forks.slice(-32),
     /// dissents the quorum absorbed (no fork raised): the same evidence shape as a fork
     dissents: () => dissentLog.slice(-32),
+    /// forks a later quorum settled: the batch reached the threshold after the dispute was raised
+    resolvedForks: () => resolved.slice(-32),
     rewards,
     /**
      * judge a fork, off chain for now (docs/L3-MINERS.md §9.2 wants an on-chain arbiter). The evidence is already
@@ -211,7 +242,7 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
       const pending = [];
       for (const s of batches.values()) if (!s.final) pending.push({ index: s.index, agree: s.agree.size, dissent: s.dissent.size, has: !!s.batch });
       pending.sort((a, b) => a.index - b.index);
-      return { threshold, finalIndex, head, halted, forks: forks.length, lastFork: forks.length ? forks[forks.length - 1] : null,
+      return { threshold, finalIndex, head, halted, forks: forks.length, resolvedForks: resolved.length, lastFork: forks.length ? forks[forks.length - 1] : null,
                equivocators: [...equivocators], tracked: batches.size, pending: pending.slice(0, 16), ...stats,
                rewards: rewards ? rewards.state() : null };
     },
