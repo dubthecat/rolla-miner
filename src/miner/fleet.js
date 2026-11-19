@@ -189,18 +189,33 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
   }
 
   // ------------------------------------------------------------- views
-  /// one shard's standing. `ok` is what a 503 is about: stalled, a dissent, or votes the log keeps refusing.
+  /// one shard's standing. `ok` is what a 503 is about: stalled, disagreeing NOW, halted, or votes the log keeps
+  /// refusing. The dissent test used to be the cumulative counter — `dissents === 0` — which made one dissent, ever,
+  /// mark the shard unhealthy for the life of the process. After the volumes filled on 2026-11-11 every shard that
+  /// had replayed a truncated journal carried one, so the fleet could never report healthy again however well it was
+  /// running. What matters is whether this miner disagrees with the sequencer about the batch it just processed; the
+  /// count is still reported, it just is not a verdict.
   function shardStatus(shard, e) {
     const s = e.miner.status();
     const voteBacklog = Math.max(0, Number(s.voteFailures || 0) - Number(s.voteRetried || 0));
-    const ok = !s.stalled && Number(s.dissents || 0) === 0 && voteBacklog === 0;
-    return { shard, ok, source: e.source, since: e.since, index: s.index, epoch: s.epoch, offset: s.offset, stalled: s.stalled, batches: s.batches, votes: s.votes, dissents: s.dissents,
-             resting: s.resting, lagSeconds: s.lagSeconds, votesPending: s.votesPending, voteBacklog, finalIndex: e.miner.quorum ? e.miner.quorum.finalIndex : null, halted: e.miner.quorum ? !!e.miner.quorum.halted : false, errors: s.errors };
+    const halted = e.miner.quorum ? !!e.miner.quorum.halted : false;
+    const disagreeing = !!(s.lastVote && s.lastVote.ok === false);
+    const ok = !s.stalled && !disagreeing && !halted && voteBacklog === 0;
+    return { shard, ok, source: e.source, since: e.since, index: s.index, epoch: s.epoch, offset: s.offset, stalled: s.stalled, batches: s.batches, votes: s.votes, dissents: s.dissents, disagreeing,
+             resting: s.resting, lagSeconds: s.lagSeconds, votesPending: s.votesPending, voteBacklog, journalBytes: s.journalBytes ?? null, journalCapped: s.journalCapped ?? null,
+             finalIndex: e.miner.quorum ? e.miner.quorum.finalIndex : null, halted, errors: s.errors };
   }
   function status() {
-    const shards = {}; let ok = ready;
+    // A fleet that has not finished bringing its shards up is STARTING, not broken. `ok` was `ready`, which only
+    // turns true after the first reconcile — and a reconcile starts shards one at a time, each replaying its journal
+    // op by op, so on 101 shards it runs for over an hour. Every `fly deploy` of a miner therefore failed its health
+    // check ("timeout reached waiting for health checks to pass") while the machine underneath was perfectly fine,
+    // which is how the fleet ended up on three different images. Not started, or an engine we have never reached, is
+    // still a 503: then we genuinely do not know what we are supposed to be mining.
+    const up = started && (!url || stats.lastPollOk > 0);
+    const shards = {}; let ok = up;
     for (const [shard, e] of miners) { const st = shardStatus(shard, e); shards[shard] = st; if (!st.ok) ok = false; }
-    return { ok, miner: address, shards, count: miners.size, static: fixed, engine: url ? { url, listed: stats.listed, lastPoll: stats.lastPoll, lastPollOk: stats.lastPollOk, polls: stats.polls, pollErrors: stats.pollErrors, lastPollError: stats.lastPollError, pollMs } : null,
+    return { ok, starting: up && !ready, miner: address, shards, count: miners.size, static: fixed, engine: url ? { url, listed: stats.listed, lastPoll: stats.lastPoll, lastPollOk: stats.lastPollOk, polls: stats.polls, pollErrors: stats.pollErrors, lastPollError: stats.lastPollError, pollMs } : null,
              started: stats.started, stopped: stats.stopped, startFailures: stats.startFailures, ready, uptime: process.uptime(),
              journals: journalDir ? { dir: journalDir, retainDays: journalRetainDays, ...jstats } : null };
   }

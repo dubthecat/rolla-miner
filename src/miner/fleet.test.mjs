@@ -67,10 +67,10 @@ test('the fleet mines the static list plus what the engine lists, stops what dis
   assert.deepEqual(log.filter((l) => l.startsWith('start')).sort(), ['start 100', 'start 200', 'start 300', 'start 7']);
 });
 
-test('health: an idle shard is fine, a stalled one, a dissent or a vote backlog is not; a miner that fails to start is retried', async () => {
+test('health: starting is not broken, an idle shard is fine, a dissent it recovered from is fine; disagreeing now, a stall or a vote backlog is not; a miner that fails to start is retried', async () => {
   const { make } = fakeMiners(); const miners = new Map(); let boom = true;
   const fleet = createFleet({ newMiner: (s) => { if (s === 'bad' && boom) throw new Error('no leader yet'); const m = make(s); miners.set(s, m); return m; }, static: ['a', 'b', 'bad'], logger: () => {} });
-  assert.equal(fleet.healthy(), false);                                   // nothing reconciled yet: not ready
+  assert.equal(fleet.healthy(), false);                                   // not started: we do not know what to mine yet
   await fleet.start();
   assert.deepEqual(fleet.shards().sort(), ['a', 'b']);
   assert.equal(fleet.stats.startFailures, 1);
@@ -78,7 +78,16 @@ test('health: an idle shard is fine, a stalled one, a dissent or a vote backlog 
   boom = false; await fleet.reconcile();                                  // the next pass picks the failed shard up
   assert.deepEqual(fleet.shards().sort(), ['a', 'b', 'bad']);
   miners.get('a').s.lagSeconds = 7200; assert.equal(fleet.healthy(), true, 'a quiet shard is not ill health');
-  miners.get('a').s.dissents = 1; assert.equal(fleet.healthy(), false); assert.equal(fleet.status().shards.a.ok, false); miners.get('a').s.dissents = 0;
+  // A dissent in the PAST is not ill health. The test used to be the cumulative counter, so one dissent ever marked
+  // the shard unhealthy for the life of the process — and after the volumes filled on 2026-11-11 every shard that
+  // had replayed a truncated journal carried one, so the fleet could never report healthy again however well it ran.
+  miners.get('a').s.dissents = 1; assert.equal(fleet.healthy(), true, 'a dissent it has since recovered from');
+  assert.equal(fleet.status().shards.a.dissents, 1, 'still reported, just not a verdict');
+  // disagreeing with the sequencer about the batch it just processed IS
+  miners.get('a').s.lastVote = { index: 9, ok: false };
+  assert.equal(fleet.healthy(), false); assert.equal(fleet.status().shards.a.ok, false); assert.equal(fleet.status().shards.a.disagreeing, true);
+  miners.get('a').s.lastVote = { index: 10, ok: true }; miners.get('a').s.dissents = 0;
+  assert.equal(fleet.healthy(), true, 'it agrees again');
   miners.get('b').s.stalled = 'the log skipped from 3 to 5'; assert.equal(fleet.healthy(), false); miners.get('b').s.stalled = null;
   miners.get('b').s.voteFailures = 3; miners.get('b').s.voteRetried = 1; assert.equal(fleet.healthy(), false); assert.equal(fleet.status().shards.b.voteBacklog, 2);
   miners.get('b').s.voteRetried = 3; assert.equal(fleet.healthy(), true);
@@ -207,5 +216,42 @@ test('the sweep waits for the engine listing, and keeps a shard it is about to m
   const r = fleet.sweepJournals();
   assert.equal(r.removed, 1, 'only the shard the engine does not list');
   assert.deepEqual(fs.readdirSync(jdir), ['700.batches.jsonl'], '700 is kept because it is intended, started or not');
+  await fleet.stop();
+});
+
+test('a fleet still bringing its shards up answers 200, not 503', async () => {
+  // `ok` used to be `ready`, which only turns true after the FIRST reconcile — and a reconcile starts shards one at a
+  // time, each replaying its journal op by op, so on the live fleet's 101 shards it runs for over an hour. Every
+  // `fly deploy` of a miner therefore failed its health check ("timeout reached waiting for health checks to pass")
+  // while the machine underneath was perfectly fine, which is how the three miners ended up on three images.
+  const { make } = fakeMiners();
+  let release; const gate = new Promise((r) => { release = r; });
+  const fleet = createFleet({
+    // a shard that takes its time to come up: on the live fleet that is a journal replayed op by op, ~1 min each
+    newMiner: (s) => { const m = make(s); const real = m.start; m.start = async () => { await gate; return real(); }; return m; },
+    engineUrl: 'http://engine', pollMs: 0, logger: () => {},
+    fetchImpl: async () => ({ ok: true, json: async () => ({ markets: [{ market: 1 }, { market: 2 }] }) }),
+  });
+  const starting = fleet.start();
+  await new Promise((r) => setTimeout(r, 20));
+  const s = fleet.status();
+  assert.equal(s.ok, true, 'a fleet mid-reconcile is healthy');
+  assert.equal(s.starting, true, 'and says so');
+  assert.equal(s.ready, false);
+  release(); await starting;
+  assert.equal(fleet.status().starting, false, 'once every shard is up it is no longer starting');
+  assert.equal(fleet.healthy(), true);
+  await fleet.stop();
+});
+
+test('an engine the fleet has never reached is still a 503: it does not know what to mine', async () => {
+  const { make } = fakeMiners();
+  const fleet = createFleet({
+    newMiner: (s) => make(s), engineUrl: 'http://engine', pollMs: 0, logger: () => {},
+    fetchImpl: async () => { throw new Error('ECONNREFUSED'); },
+  });
+  await fleet.start();
+  assert.equal(fleet.healthy(), false, 'no listing has ever arrived');
+  assert.equal(fleet.status().starting, false);
   await fleet.stop();
 });
