@@ -28,6 +28,8 @@
 // idempotent by offset. The miner keeps `lastOffset` in its journal and ignores anything it has already applied.
 import fs from 'node:fs';
 import path from 'node:path';
+import { createConnection } from '../kafka/client.js';
+import { createReader } from '../kafka/reader.js';
 
 const SAFE = (t) => String(t).replace(/[^a-zA-Z0-9._-]/g, '_');
 /// bigints are everywhere in this codebase (prices, sizes) and JSON.stringify refuses them. The log's records
@@ -161,7 +163,7 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
 /// why a fleet took days to bring up 101 shards: `startShard` awaits the subscription, and the subscription was
 /// waiting on a coordinator buried under twenty thousand dead groups.
 export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPrefix = 'rolla-l3', ssl = undefined, sasl = undefined, logger = null, partitions = 1, replication = 1, acks = -1, connectionTimeout = 10000, retries = 2, readTimeoutMs = 15000, pollWaitMs = 15000,
-  maxPart = 2 << 20, maxFetch = 4 << 20 } = {}) {
+  maxPart = 2 << 20, maxFetch = 4 << 20, reader: readerKind = 'kafkajs' } = {}) {
   const list = Array.isArray(brokers) ? brokers : String(brokers || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!list.length) throw new Error('KafkaLog needs L3_KAFKA_BROKERS');
   let Kafka, logLevel;
@@ -174,6 +176,19 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
   await producer.connect();
   const admin = kafka.admin(); await admin.connect();
   const known = new Set(); const consumers = new Set();
+  // The native reader, when asked for: one connection and no consumer group for every topic this process follows
+  // (engine/l3/kafka/reader.js). Produce and admin stay on kafkajs — they are rare and cost nothing — so this is a
+  // swap of the read path only. `L3_LOG_READER=kafkajs` puts it back.
+  let native = null, nativeConn = null;
+  if (readerKind === 'native') {
+    if (ssl || sasl) logger && logger('[l3log] L3_LOG_READER=native does not speak SSL or SASL yet — staying on kafkajs');
+    else {
+      const [h, p0] = String(list[0]).split(':');
+      nativeConn = createConnection({ host: h, port: Number(p0 || 9092), clientId, logger });
+      native = createReader({ conn: nativeConn, logger, partitionMaxBytes: maxPart, maxBytes: maxFetch, missingWaitMs: pollWaitMs });
+      logger && logger(`[l3log] reading natively from ${h}:${p0 || 9092} — one connection, no consumer groups`);
+    }
+  }
   /// does the broker hold this topic? `known` is only ever a positive cache — a topic that is absent must be
   /// re-checked, because the shard's owner may create it at any moment.
   async function exists(topic) {
@@ -223,6 +238,8 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     exists,
     /// every topic the broker holds (the retirement sweep's input; '' on failure rather than a throw)
     async topics() { try { return await admin.listTopics(); } catch { return []; } },
+    /// the native reader's counters, or null when this log reads through kafkajs
+    readerStats: () => (native ? native.stats() : null),
     /// the shard's OWNER creates its topics, explicitly, once — readers never do
     async ensureTopic(topic) { await ensure(topic); known.add(topic); return true; },
     /// watermark-driven: the records the topic holds NOW from `fromOffset` (at most `limit`), returned as soon as
@@ -252,6 +269,17 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
     /// kafkajs's consumer auto-creates too, so BOTH that flag and `ensure` have to go for a reader.
     async subscribe(topic, fromOffset, handler, { create = false } = {}) {
       if (create) await ensure(topic);
+      // The native reader (engine/l3/kafka): every topic this process follows on ONE connection in ONE Fetch, with
+      // no consumer group at all. Measured against the 14 live shards this fleet was following, over this broker:
+      // subscribe 2 ms against 24,941 ms, first record p50 2.1 s against 14.2 s, 1 connection and 0 groups against
+      // 14 and 14. The group was never wanted — every miner must see every record — and working around it is what
+      // left 20,230 Empty groups on the broker and made a fleet take 45 minutes to pick up 79 shards.
+      // A missing topic is the reader's own business: it backs off and attaches when the topic appears, which is
+      // the same contract as the kafkajs path below and the reason this returns without waiting.
+      if (native) {
+        const h = native.subscribe(topic, Math.max(0, Number(fromOffset) || 0), handler);
+        return { async close() { h.close(); }, stats: () => h.stats() };
+      }
       else if (!(await exists(topic))) {
         // Wait for it rather than hand back a dead handle. A reader must not create the topic — that is what let a
         // retired shard's log come back, empty and still holding the broker's per-topic floor — but it must also not
@@ -305,6 +333,8 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
       return { async close() { consumers.delete(consumer); try { await consumer.disconnect(); } catch {} } };
     },
     async close() {
+      if (native) { try { await native.stop(); } catch { } }
+      if (nativeConn) { try { nativeConn.close(); } catch { } }
       for (const c of consumers) { try { await c.disconnect(); } catch {} }
       consumers.clear();
       try { await producer.disconnect(); } catch {}
@@ -326,6 +356,7 @@ export async function createLog({ env = process.env, dir = null, clientId = 'rol
       replication: Number(env.L3_KAFKA_REPLICATION || 1), retries: Number(env.L3_KAFKA_RETRIES || 2), readTimeoutMs: Number(env.L3_KAFKA_READ_MS || 15000),
       maxPart: Math.max(1 << 20, Number(env.L3_KAFKA_FETCH_PARTITION || 2 << 20)),
       maxFetch: Math.max(1 << 20, Number(env.L3_KAFKA_MAX_BYTES || 4 << 20)),
+      reader: (env.L3_LOG_READER || 'kafkajs').toLowerCase(),
       connectionTimeout: Number(env.L3_KAFKA_CONNECT_MS || 10000),
       ssl: env.L3_KAFKA_SSL === '1' ? {} : undefined,
       sasl: env.L3_KAFKA_USER ? { mechanism: env.L3_KAFKA_MECHANISM || 'scram-sha-256', username: env.L3_KAFKA_USER, password: env.L3_KAFKA_PASS || '' } : undefined });
