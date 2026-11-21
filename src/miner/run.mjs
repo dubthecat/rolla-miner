@@ -101,7 +101,8 @@ if (rpcs.length && /^0x[0-9a-fA-F]{40}$/.test(desk)) {
 }
 
 const main = async () => {
-  const theLog = await createLog({ env, dir: env.L3_LOG_DIR || path.join(dataDir, 'l3', 'log'), clientId: `rolla-miner-${String(shard)}-${process.pid}`, logger: (m) => log('info', m) });
+  // the group id must be STABLE across restarts and unique to this miner (log.js): its address is both
+  const theLog = await createLog({ env, dir: env.L3_LOG_DIR || path.join(dataDir, 'l3', 'log'), clientId: `rolla-miner-${String(shard)}-${process.pid}`, groupPrefix: `miner-${account.address.toLowerCase()}`, logger: (m) => log('info', m) });
   const miner = createMiner({
     shard, log: theLog, account, domain, dir, grantOf,
     sequencers: (env.L3_SEQUENCERS || '').split(',').map((s) => s.trim()).filter(Boolean),
@@ -195,7 +196,7 @@ const mainFleet = async () => {
 
   const retryMs = Number(env.L3_LOG_BOOT_RETRY_MS || 5000);   // not L3_LOG_RETRY_MS: that is the sequencer's failed-connect memory
   for (let attempt = 1; !theLog && !stopping; attempt++) {
-    try { theLog = await createLog({ env, dir: env.L3_LOG_DIR || path.join(dataDir, 'l3', 'log'), clientId: `rolla-miner-fleet-${process.pid}`, logger: (m) => log('info', m) }); }
+    try { theLog = await createLog({ env, dir: env.L3_LOG_DIR || path.join(dataDir, 'l3', 'log'), clientId: `rolla-miner-fleet-${process.pid}`, groupPrefix: `miner-${account.address.toLowerCase()}`, logger: (m) => log('info', m) }); }
     catch (e) {
       if (ONCE) throw e;
       log('error', 'log unavailable', { attempt, err: e?.message || String(e), retryMs, brokers: env.L3_KAFKA_BROKERS || null });

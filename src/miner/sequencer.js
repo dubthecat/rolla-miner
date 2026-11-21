@@ -469,7 +469,8 @@ export function createSequencerRig({
 
   async function boot() {
     logDown.attempts++;
-    logImpl = await createLog({ env, dir: logDir, clientId: `rolla-seq-${process.pid}`, logger: logFn });
+    // stable per rig, not per process: a pid in the group id is how the broker reached 20,230 consumer groups
+    logImpl = await createLog({ env, dir: logDir, clientId: `rolla-seq-${process.pid}`, groupPrefix: `seq-${lower(acct.address)}`, logger: logFn });
     logFn(`[l3rig] sequencing into ${logImpl.kind} log${logImpl.dir ? ' at ' + logImpl.dir : ''} · threshold ${threshold}${allow.length ? ` · ${allow.length} allowed miner(s)` : ' · any signed vote counts'}`);
     logDown.at = 0; logDown.error = null;
     return logImpl;

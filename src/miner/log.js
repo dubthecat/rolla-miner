@@ -152,11 +152,16 @@ export function createFileLog({ dir, pollMs = 5, fsync = false, logger = null } 
 
 // ------------------------------------------------------------------------------------------------ KafkaLog
 /// brokers: 'host:9092,host2:9092' or an array. clientId identifies this process in the broker's logs.
-/// groupPrefix keeps two miners on one broker from sharing a consumer group — each subscription gets its own
-/// group, because every miner must see EVERY record, not a share of them (this is a replicated log, not a work
-/// queue; the earlier concept's `group.id: 'validators'` load-balanced orders across validators, which is
-/// exactly what must NOT happen here).
-export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPrefix = 'rolla-l3', ssl = undefined, sasl = undefined, logger = null, partitions = 1, replication = 1, acks = -1, connectionTimeout = 10000, retries = 2, readTimeoutMs = 15000, pollWaitMs = 15000 } = {}) {
+/// groupPrefix keeps two miners on one broker from sharing a consumer group — every miner must see EVERY record,
+/// not a share of them (this is a replicated log, not a work queue; the earlier concept's `group.id: 'validators'`
+/// load-balanced orders across validators, which is exactly what must NOT happen here). So it must be STABLE and
+/// unique per consumer: pass the miner's address, or the engine's. It used to carry a random suffix per
+/// subscription, which made a new consumer group every time anything subscribed to anything — 20,230 groups
+/// against 307 topics on the live broker by 2026-11-21, each one a coordinator the broker keeps running. That is
+/// why a fleet took days to bring up 101 shards: `startShard` awaits the subscription, and the subscription was
+/// waiting on a coordinator buried under twenty thousand dead groups.
+export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPrefix = 'rolla-l3', ssl = undefined, sasl = undefined, logger = null, partitions = 1, replication = 1, acks = -1, connectionTimeout = 10000, retries = 2, readTimeoutMs = 15000, pollWaitMs = 15000,
+  maxPart = 2 << 20, maxFetch = 4 << 20 } = {}) {
   const list = Array.isArray(brokers) ? brokers : String(brokers || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!list.length) throw new Error('KafkaLog needs L3_KAFKA_BROKERS');
   let Kafka, logLevel;
@@ -265,15 +270,25 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
         timer = setTimeout(tryAttach, wait); timer.unref?.();
         return { waiting: true, topic, close() { closed2 = true; if (timer) clearTimeout(timer); if (real) real.close(); }, stats: () => (real ? real.stats() : { offset: -1, errors: 0, waiting: true }) };
       }
-      const groupId = `${groupPrefix}-${topic}-${Math.random().toString(36).slice(2, 10)}`;
-      // a batch of 2,000 orders is ~1.2 MB; kafkajs's default fetch (1 MiB per partition) then carries ONE batch per
-      // round trip, and a miner far from the broker pays that round trip per batch on top of its own work. Fetch
-      // up to 16 MiB (8 MiB per partition, the broker's message limit) so one trip carries several batches.
-      const consumer = kafka.consumer({ groupId, sessionTimeout: 30000, allowAutoTopicCreation: !!create, maxBytesPerPartition: 8 << 20, maxBytes: 16 << 20, maxWaitTimeInMs: 50 });
+      // stable per (consumer, topic): the same miner re-subscribing after a restart REUSES its group instead of
+      // leaving another behind. Nothing is ever committed to it (`autoCommit: false`) and the seek below is
+      // authoritative, so the group is a name, not a cursor.
+      const groupId = `${groupPrefix}-${topic}`;
+      // A batch of 2,000 orders is ~1.2 MB; kafkajs's default fetch (1 MiB per partition) then carries ONE batch per
+      // round trip, and a miner far from the broker pays that round trip per batch on top of its own work. So this
+      // asked for 16 MiB a fetch, 8 MiB a partition — sized for ONE shard, which is what a miner was when it was
+      // written. A fleet member holds two subscriptions per shard and ~101 shards, so the same numbers became 202
+      // consumers each sizing its fetch for a 2,000-order batch, on a 1 GB machine. All three miners were
+      // OOM-killed roughly every fifty minutes (`exit_code=137, oom_killed=true`), which is why they never
+      // finished their first reconcile and sat at `starting: true` with 10 to 19 of their shards up for two days.
+      // The defaults below are sized for a fleet and still clear the worst single batch; L3_KAFKA_MAX_BYTES and
+      // L3_KAFKA_FETCH_PARTITION raise them for a process that really does mine one busy shard.
+      const consumer = kafka.consumer({ groupId, sessionTimeout: 30000, allowAutoTopicCreation: !!create, maxBytesPerPartition: maxPart, maxBytes: maxFetch, maxWaitTimeInMs: 50 });
       await consumer.connect();
       await withLeader(`subscribe ${topic}`, () => consumer.subscribe({ topic, fromBeginning: true }));
       let seeked = false;
       await consumer.run({
+        autoCommit: false,          // the offset lives in the caller's `fromOffset`, never in the broker
         eachMessage: async ({ message, partition }) => {
           const offset = Number(message.offset);
           if (offset < fromOffset) return;
@@ -281,8 +296,11 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
           await handler({ offset, value, topic, partition });
         },
       });
-      // seek must happen after run(); a consumer that joins the group fresh would otherwise re-read from 0
-      if (fromOffset > 0 && !seeked) { try { consumer.seek({ topic, partition: 0, offset: String(fromOffset) }); seeked = true; } catch (e) { logger && logger(`[l3log] seek failed on ${topic}: ${e.message}`); } }
+      // Seek must happen after run(), and it happens for offset 0 too. With a per-subscription group id a fresh
+      // group always began at 0 and seeking 0 was a no-op; with a stable group the broker may remember where that
+      // group once was, so "from the beginning" has to be stated rather than assumed — the votes topic is re-read
+      // from 0 at every start and finality depends on it.
+      if (!seeked) { try { consumer.seek({ topic, partition: 0, offset: String(Math.max(0, fromOffset)) }); seeked = true; } catch (e) { logger && logger(`[l3log] seek failed on ${topic}: ${e.message}`); } }
       consumers.add(consumer);
       return { async close() { consumers.delete(consumer); try { await consumer.disconnect(); } catch {} } };
     },
@@ -297,11 +315,17 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
 }
 
 /// pick an implementation from the environment: L3_LOG=file|kafka (default file), L3_LOG_DIR, L3_KAFKA_BROKERS.
-export async function createLog({ env = process.env, dir = null, clientId = 'rolla-l3', logger = null } = {}) {
+/// `groupPrefix` must be stable across restarts and unique to this consumer (see createKafkaLog): the miner's
+/// address, or L3_GROUP. Falling back to the clientId is what the engine does, and a clientId carrying a pid is
+/// how groups accumulated in the first place — so pass one.
+export async function createLog({ env = process.env, dir = null, clientId = 'rolla-l3', groupPrefix = null, logger = null } = {}) {
   const kind = (env.L3_LOG || 'file').toLowerCase();
   if (kind === 'kafka' || kind === 'redpanda') {
     return createKafkaLog({ brokers: env.L3_KAFKA_BROKERS || '127.0.0.1:9092', clientId, logger,
+      groupPrefix: groupPrefix || env.L3_GROUP || clientId,
       replication: Number(env.L3_KAFKA_REPLICATION || 1), retries: Number(env.L3_KAFKA_RETRIES || 2), readTimeoutMs: Number(env.L3_KAFKA_READ_MS || 15000),
+      maxPart: Math.max(1 << 20, Number(env.L3_KAFKA_FETCH_PARTITION || 2 << 20)),
+      maxFetch: Math.max(1 << 20, Number(env.L3_KAFKA_MAX_BYTES || 4 << 20)),
       connectionTimeout: Number(env.L3_KAFKA_CONNECT_MS || 10000),
       ssl: env.L3_KAFKA_SSL === '1' ? {} : undefined,
       sasl: env.L3_KAFKA_USER ? { mechanism: env.L3_KAFKA_MECHANISM || 'scram-sha-256', username: env.L3_KAFKA_USER, password: env.L3_KAFKA_PASS || '' } : undefined });
