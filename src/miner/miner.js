@@ -26,6 +26,7 @@
 //
 // Observability: /healthz and /metrics in the shape engine/rolla-node.mjs established.
 import fs from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import http from 'node:http';
 import path from 'node:path';
 import { createBook } from '../matcher.js';
@@ -52,6 +53,43 @@ const lower = (a) => String(a || '').toLowerCase();
 /// over every resting order, `L3_COMMIT=tree` keeps the incremental Merkle-treap fed from the book's own events
 /// — an order that rests, a maker partially filled or filled out, a cancel that hits — right here in apply(), so
 /// the boundary is a read. `commit` is a mode string or createCommitState's options; unset, the environment decides.
+/// Read a JSONL file a line at a time without materialising it. `fs.readFileSync(f,'utf8').split('\n')` on a
+/// journal capped at L3_JOURNAL_MAX_BYTES (16 MB) costs a 16 MB buffer, a ~32 MB V8 string, an array of tens of
+/// thousands of strings and then a filtered copy of that array — about 100 MB of transient allocation, twice per
+/// shard (batches and votes). A fleet member starts ~80 shards one after another, and with 6 shards up a miner was
+/// already holding 386 MB of a 964 MB machine. `onLine` returning false stops the read.
+const MAX_LINE = 8 << 20;          // a journal line is a batch; 8 MB is past the broker's own message limit
+export function eachLine(file, onLine, chunkBytes = 1 << 20) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch { return; }
+  try {
+    const buf = Buffer.allocUnsafe(chunkBytes);
+    // A StringDecoder, not buf.toString(): a chunk boundary falls wherever the file says, and a plain decode of a
+    // chunk that ends mid-code-point yields U+FFFD and corrupts that line's JSON. A market question carries
+    // arbitrary UTF-8, so this is not theoretical — the test writes '€', '¥' and 日本語 across every boundary.
+    const dec = new StringDecoder('utf8');
+    let tail = '';
+    for (;;) {
+      const read = fs.readSync(fd, buf, 0, chunkBytes, null);
+      if (read <= 0) break;
+      const text = tail + dec.write(buf.subarray(0, read));
+      let from = 0;
+      for (;;) {
+        const nl = text.indexOf('\n', from);
+        if (nl < 0) break;
+        const line = text.slice(from, nl); from = nl + 1;
+        if (line && onLine(line) === false) return;
+      }
+      tail = text.slice(from);
+      // a line longer than this is not one of ours. The bound is absolute: as a multiple of the chunk it threw away
+      // every ordinary line whenever the chunk was small, which is exactly how the tests read the file.
+      if (tail.length > MAX_LINE) tail = '';
+    }
+    tail += dec.end();
+    if (tail && onLine(tail) === false) return;
+  } finally { try { fs.closeSync(fd); } catch { } }
+}
+
 export function createShardState({ newBook = null, logger = null, commit = null, env = process.env } = {}) {
   const make = newBook || (() => createBook());
   const books = new Map();     // `${market}:${outcome}` → book
@@ -351,18 +389,24 @@ export function createMiner({
   /// L3_VERIFY_REPLAY=1.
   function replayJournal() {
     if (!jBatches || !fs.existsSync(jBatches)) return { ok: true, replayed: 0, dissented: 0 };
-    let lines = [];
-    try { lines = fs.readFileSync(jBatches, 'utf8').split('\n').filter(Boolean); } catch { return { ok: true, replayed: 0, dissented: 0 }; }
     // what this miner SIGNED for each batch is the expectation — a batch it dissented on is reproduced by its own
     // root, not the sequencer's (a journal holding an honest dissent used to be thrown away as corrupt, the shard
     // re-read from the log and the same dissent published again at every restart). The batch line carries it
     // (`root`) since 2026-10-07; older lines are matched against the votes journal, and only then the batch's.
-    const voted = new Map();
-    if (jVotes && fs.existsSync(jVotes)) { try { for (const line of fs.readFileSync(jVotes, 'utf8').split('\n')) { if (!line) continue; try { const v = JSON.parse(line); if (v && Number.isFinite(Number(v.index)) && typeof v.batchRoot === 'string') voted.set(Number(v.index), v.batchRoot); } catch {} } } catch {} }
-    let n = 0, dissented = 0;
-    for (const line of lines) {
-      let rec; try { rec = JSON.parse(line); } catch { continue; }
-      const batch = rec.batch; if (!batch || Number(batch.index) <= index) continue;
+    // The votes journal is only a fallback for batch lines written before 2026-10-07 (they carry `root` themselves
+    // now), so it is read on the first line that needs it and usually never.
+    let voted = null;
+    const votedRoot = (i) => {
+      if (!voted) {
+        voted = new Map();
+        if (jVotes) eachLine(jVotes, (line) => { try { const v = JSON.parse(line); if (v && Number.isFinite(Number(v.index)) && typeof v.batchRoot === 'string') voted.set(Number(v.index), v.batchRoot); } catch { } });
+      }
+      return voted.get(i);
+    };
+    let n = 0, dissented = 0, refused = null;
+    eachLine(jBatches, (line) => {
+      let rec; try { rec = JSON.parse(line); } catch { return; }
+      const batch = rec.batch; if (!batch || Number(batch.index) <= index) return;
       // The journal must begin at the shard's first batch. Replay rebuilds the book by applying every operation from
       // the start, so a journal that has lost its HEAD replays from the middle onto an empty book and produces a
       // state that is wrong in a way nothing downstream can see: the miner then computes a different batchRoot from
@@ -373,21 +417,22 @@ export function createMiner({
       // `minerWhy: null`, which is the signature of a state divergence rather than a batch anyone thinks is invalid.
       // The self-consistency check below cannot catch it, because the root a miner compares against is read from the
       // same truncated journal, so a journal missing only its head agrees with itself perfectly.
-      if (index < 0 && Number(batch.index) !== 0) return { ok: false, why: `journal starts at batch ${batch.index}, not 0 — its head was lost, so replay would rebuild the wrong book`, replayed: n, dissented };
-      if (index >= 0 && Number(batch.index) !== index + 1) return { ok: false, why: `journal skips ${index} → ${batch.index}`, replayed: n, dissented };
+      if (index < 0 && Number(batch.index) !== 0) { refused = `journal starts at batch ${batch.index}, not 0 — its head was lost, so replay would rebuild the wrong book`; return false; }
+      if (index >= 0 && Number(batch.index) !== index + 1) { refused = `journal skips ${index} → ${batch.index}`; return false; }
       const ops = Array.isArray(batch.ops) ? batch.ops : [];
       let fills = [];
       for (const op of ops) { const r = state.apply(op); if (r.fills?.length) fills.push(...r.fills); }
       state.flush();
       const bookHash = (batch.bookHash && batch.bookHash !== ZERO32) ? state.bookHash() : ZERO32;
       const myRoot = batchRootOf({ shard: String(shard), epoch: Number(batch.epoch), index: Number(batch.index), seqFrom: Number(batch.seqFrom), seqTo: Number(batch.seqTo), prevRoot: batch.prevRoot || ZERO32, ordersRoot: ordersRootOf(ops), fillsRoot: fillsRootOf(fills), bookHash });
-      const signed = rec.root || voted.get(Number(batch.index)) || batch.batchRoot;
-      if (myRoot !== signed) return { ok: false, why: `journal batch ${batch.index} no longer reproduces the root this miner signed`, replayed: n, dissented };
+      const signed = rec.root || votedRoot(Number(batch.index)) || batch.batchRoot;
+      if (myRoot !== signed) { refused = `journal batch ${batch.index} no longer reproduces the root this miner signed`; return false; }
       if (myRoot !== batch.batchRoot) dissented++;
       index = Number(batch.index); epoch = Number(batch.epoch); prevRoot = batch.batchRoot; offset = Number(rec.offset);
       if (bookHash !== ZERO32) lastBookHash = bookHash;
       n++; m.replayed++;
-    }
+    });
+    if (refused) return { ok: false, why: refused, replayed: n, dissented };
     return { ok: true, replayed: n, dissented };
   }
 
