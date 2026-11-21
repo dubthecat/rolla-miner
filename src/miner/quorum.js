@@ -26,7 +26,17 @@ import { recoverDigestSigner } from './verify.js';
 
 /// miners: an allowlist (array/Set of addresses) or null for "anyone who signs". threshold: distinct agreeing
 /// miners needed. verify: (vote) => Promise<address|null>, overridable for tests and for a registry check.
-export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep = 4096, verify = null, rewards = null, onFinal = null, onFork = null, logger = null } = {}) {
+/// What a slot keeps of a batch. A sealed batch carries its OPS — up to `L3_BATCH_MAX` (500) signed orders, which
+/// is a few hundred KB — and after `announce` has checked that it hashes to the root it claims, nothing reads them
+/// again: `batchRootOf` covers only the header, quorum.js itself reads `epoch`, and the one thing downstream does
+/// with the batch is `finalOf(batch, fills)`, which takes shard, index, batchRoot, prevRoot and fillsRoot.
+/// Keeping the ops cost the live engine its heap a second time: 368,014 slots across 95 shards, RSS back to 2.79 GB
+/// two days after the order map was fixed.
+const headerOf = (b) => ({ shard: b.shard, epoch: b.epoch, index: b.index, seqFrom: b.seqFrom, seqTo: b.seqTo,
+  prevRoot: b.prevRoot || ZERO32, ordersRoot: b.ordersRoot, fillsRoot: b.fillsRoot, bookHash: b.bookHash || ZERO32,
+  batchRoot: b.batchRoot, sig: b.sig });
+
+export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep = Math.max(16, Number(process.env.L3_QUORUM_KEEP || 512)), verify = null, rewards = null, onFinal = null, onFork = null, logger = null } = {}) {
   const allow = miners ? new Set([...miners].map((a) => String(a).toLowerCase())) : null;
   const batches = new Map();        // index → { batch, root, votes: Map<miner, vote>, agree: Set, dissent: Map, final, announced }
   const equivocators = new Set();
@@ -96,7 +106,9 @@ export function createQuorum({ threshold = 2, miners = null, haltAfter = 1, keep
     }
     const s = slotOf(index);
     if (s.batch && s.root !== root) { fork(index, 'two different batches at the same index (sequencer equivocation)', { had: s.root, got: root }); return { ok: false, slot: s }; }
-    s.batch = batch; s.root = root;
+    // the header only: the ops have done their job (the root above is checked against them) and nothing reads them
+    // again. `keep` slots per shard x 95 shards is a lot of batches to be holding whole.
+    s.batch = headerOf(batch); s.root = root;
     stats.batches++;
     if (index > head) head = index;
     // the hash chain: this batch must follow the previous one we saw

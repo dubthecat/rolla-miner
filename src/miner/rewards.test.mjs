@@ -250,3 +250,51 @@ test('a stale vote costs an integer compare, not a signature recovery', async ()
   await q.vote(vote(C, live, 1));
   assert.equal(recoveries, 3, 'a batch still in `batches` is never stale, even below finalIndex');
 });
+
+test('a slot keeps a batch header, not the batch: the ops are not retained', async () => {
+  // A sealed batch carries up to L3_BATCH_MAX (500) signed orders — a few hundred KB — and after announce() has
+  // checked that it hashes to the root it claims, nothing reads them again. Keeping them cost the live engine its
+  // heap a SECOND time: two days after the order map was bounded, RSS was back to 2.79 GB with 368,014 slots held
+  // across 95 shards. What the rest of the system wants from a batch is its header: quorum.js reads `epoch`, and
+  // `finalOf(batch, fills)` reads shard, index, batchRoot, prevRoot and fillsRoot.
+  const finals = [];
+  const q = createQuorum({ threshold: 2, verify: async (v) => v.miner, onFinal: (f) => finals.push(f) });
+  const b0 = fake(0, ZERO32);
+  b0.ops = Array.from({ length: 200 }, (_, i) => ({ t: 'add', hash: '0x' + String(i).padStart(64, '0'), sig: '0x' + 'ab'.repeat(65) }));
+  q.announce(b0);
+  await q.vote(vote(A, b0, 3)); await q.vote(vote(B, b0, 3));
+  assert.equal(q.finalIndex, 0, 'it still finalizes');
+  const kept = finals[0].batch;
+  assert.equal(kept.ops, undefined, 'the ops were retained');
+  // and everything the attestation path reads is there (engine/l3/root.js finalOf)
+  for (const k of ['shard', 'index', 'epoch', 'batchRoot', 'prevRoot', 'fillsRoot', 'ordersRoot', 'bookHash', 'seqFrom', 'seqTo']) {
+    assert.notEqual(kept[k], undefined, `finalOf and the rewards need ${k}`);
+  }
+  assert.equal(kept.batchRoot, b0.batchRoot);
+  assert.equal(finals[0].epoch, Number(b0.epoch));
+  // a re-announce of the same batch is still judged against the header, not confused by it
+  q.announce(b0);
+  assert.deepEqual(q.forks(), [], 'a duplicate delivery raised a fork');
+});
+
+test('a quorum holds at most `keep` finalized slots, however long the shard runs', async () => {
+  // The engine runs one of these per shard — 95 of them — so the per-shard cap is a venue-wide memory budget, and
+  // it was 4,096. Only FINALIZED slots are dropped: a disputed batch is never pruned to make room, because the
+  // evidence is the whole point of keeping it.
+  const q = createQuorum({ threshold: 2, verify: async (v) => v.miner, keep: 32 });
+  let prev = ZERO32;
+  for (let i = 0; i < 200; i++) {
+    const b = fake(i, prev); prev = b.batchRoot;
+    q.announce(b);
+    await q.vote(vote(A, b, 1)); await q.vote(vote(B, b, 1));
+  }
+  assert.equal(q.finalIndex, 199, 'finality did not keep up');
+  assert.ok(q.status().tracked <= 32, `holding ${q.status().tracked} slots against a cap of 32`);
+  // and an unfinalized batch is kept whatever the cap says
+  const stuck = fake(200, prev);
+  q.announce(stuck);
+  await q.vote(vote(A, stuck, 1));                       // one vote: never reaches the threshold
+  for (let i = 201; i < 240; i++) { const b = fake(i, i === 201 ? stuck.batchRoot : prev); prev = b.batchRoot; q.announce(b); await q.vote(vote(A, b, 1)); await q.vote(vote(B, b, 1)); }
+  assert.equal(q.finalIndex, 199, 'finality advanced past a batch that never reached the threshold');
+  assert.ok(q.at(200), 'the unfinalized batch was pruned away');
+});
