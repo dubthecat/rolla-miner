@@ -691,7 +691,11 @@ async function reconcileScenario() {
   const r1 = await signed(0, true, 40), r2 = await signed(0, true, 41), r3 = await signed(1, false, 60);
   for (const [b, rec] of [[b0, r1], [b0, r2], [b1, r3]]) { const r = add(b, rec); assert.ok(rig.record(b, rec, r.fills, r)); await rig.flush(); }
   const log = await createLog({ env, dir: path.join(dir, 'log'), logger: () => {} });
-  const mk = () => createMiner({ shard: SHARD, log, account: minerAcct, domain, dir: path.join(dir, 'miner'), workers: 0, sequencers: [operator.address], threshold: 1, logger: () => {}, env });
+  // Checkpoints OFF for this scenario on purpose: it is about the JOURNAL — an older miner's lines without
+  // `root`, and a journal that really is corrupt — and a checkpoint would resume past all of it without ever
+  // reading the journal. That is the right behaviour in production (checkpoint.test.mjs measures what it saves)
+  // and it is precisely what must not happen while the journal's own fallback is under test.
+  const mk = () => createMiner({ shard: SHARD, log, account: minerAcct, domain, dir: path.join(dir, 'miner'), workers: 0, sequencers: [operator.address], threshold: 1, logger: () => {}, env: { ...env, L3_CHECKPOINT_BATCHES: '0' } });
   let miner = mk(); await miner.start();
   const upTo = async (m, i) => { const dl = Date.now() + 30000; while (Date.now() < dl && m.index < i) await new Promise((r) => setTimeout(r, 10)); assert.equal(m.index, i, `the miner is at ${m.index}, not ${i}`); };
   const finalAt = async (q, i) => { const dl = Date.now() + 30000; while (Date.now() < dl && q.finalIndex < i) await new Promise((r) => setTimeout(r, 10)); assert.equal(q.finalIndex, i, `finality is at ${q.finalIndex}, not ${i}`); };

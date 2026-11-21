@@ -34,6 +34,7 @@ import { parseL3Order, BOOK_DOMAIN, signL3Final } from '../desk.js';
 import { fillsRootOf, ordersRootOf, batchRootOf, voteDigestOf, merkleProof, fillLeaf, shardId, ZERO32 } from './merkle.js';
 import { createVerifier, recoverDigestSigner, signDigest } from './verify.js';
 import { createQuorum } from './quorum.js';
+import * as checkpoint from './checkpoint.js';
 import { rewardsFromEnv } from './rewards.js';
 import { ordersTopic, votesTopic } from './log.js';
 import { createCommitState } from './commit-state.js';
@@ -121,6 +122,12 @@ export function createShardState({ newBook = null, logger = null, commit = null,
   }
   return {
     apply, bookFor, books, resting, commit: cs,
+    /// Put the shard's op counter back where a checkpoint left it. The batch's seqFrom/seqTo are this counter, so
+    /// a restored shard that started it over would describe ranges the sequencer never sealed.
+    restoreSeq(n) { const v = Number(n); if (!Number.isInteger(v) || v < 0) throw new Error(`restoreSeq: ${n}`); seq = v; return seq; },
+    /// seed the commitment from the books as they stand — what a checkpoint restore needs once the books are back
+    /// (a no-op in bookhash mode, where root() walks the books anyway)
+    seedCommit() { cs.seed(resting()); cs.flush(); },
     /// the epoch-boundary book commitment: bookHashOf(resting()) or the tree's root, by L3_COMMIT
     bookHash: () => cs.root(),
     /// push the buffered commitment updates to the tree (a batch boundary; a no-op for bookhash)
@@ -223,6 +230,22 @@ export function createMiner({
     }
     jBytes = 0; jCapped = false;
   }
+  // The checkpoint (checkpoint.js): the book as of a known batch, so a restart does not re-verify the log. Written
+  // every L3_CHECKPOINT_BATCHES applied batches; 0 turns it off. A miner that has one starts from it instead of
+  // replaying, which is the difference between seconds and the ~6.9 minutes of secp256k1 this fleet pays per
+  // restart today — and the difference between possible and not once a shard's log holds millions of orders.
+  const CHECKPOINT_EVERY = Math.max(0, Number(env.L3_CHECKPOINT_BATCHES ?? 200));
+  const cpStats = { written: 0, loaded: 0, refused: 0, lastAt: null, lastIndex: -1, lastWhy: null, ms: 0 };
+  function writeCheckpoint(bookHash) {
+    if (!dir || !CHECKPOINT_EVERY) return;
+    const t0 = Date.now();
+    try {
+      const snap = checkpoint.snapshot(state, { shard, index, epoch, prevRoot, offset, bookHash: bookHash && bookHash !== ZERO32 ? bookHash : null });
+      checkpoint.write(dir, shard, snap);
+      cpStats.written++; cpStats.lastAt = new Date(t0).toISOString(); cpStats.lastIndex = index; cpStats.ms += Date.now() - t0;
+    } catch (e) { cpStats.lastWhy = e.message; logFn(`[l3miner] ${shard}: could not write a checkpoint (${e.message})`); }
+  }
+
   /// may batch `next`'s pair be journalled? False once the shard's journal is full (or there is no journal at all).
   const size = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${n} B`);
   const journalRoom = (next) => {
@@ -332,6 +355,10 @@ export function createMiner({
       }
       recent.set(mine.index, { batch, fills });
       if (recent.size > keepFills) { const oldest = Math.min(...recent.keys()); recent.delete(oldest); }
+      // the book, the index, the epoch, the chain root and the log offset are all consistent at exactly this point
+      // index > 0: a checkpoint of the book at batch ZERO is worth nothing and would shadow a journal that has
+      // far more in it — the cheapest route is whichever is furthest ahead, and at index 0 that is never this.
+      if (CHECKPOINT_EVERY && index > 0 && index % CHECKPOINT_EVERY === 0) writeCheckpoint(bookHash);
       lastVote = vote;
       // the vote joins the append pipeline: the next batch is verified while this vote is in flight (a vote
       // used to cost one log round trip per batch — on RunPod the miners fell 12 s behind a sequencer they
@@ -443,7 +470,27 @@ export function createMiner({
       make = await bookFactory({ env, dir, logger: logFn });
       state.close(); state = newState();
     }
-    const r = replayJournal();
+    // A checkpoint first: it is O(resting) where the journal is O(ops) and the log is O(ops) PLUS a signature
+    // check apiece. It is self-checking — the file carries the bookHash the restored book has to reproduce — and
+    // a refusal is not a problem, it just means doing what we did before.
+    const cp = CHECKPOINT_EVERY && dir ? checkpoint.read(dir, shard) : null;
+    if (cp) {
+      try {
+        const t0 = Date.now();
+        const got = checkpoint.restore(state, cp, { commitMode: state.commit.mode });
+        index = got.index; epoch = got.epoch; prevRoot = got.prevRoot || ZERO32; offset = got.offset;
+        lastBookHash = cp.bookHash;
+        cpStats.loaded++;
+        logFn(`[l3miner] ${shard}: resumed from a checkpoint at batch ${index} (${got.resting} resting, book ${String(cp.bookHash).slice(0, 12)}…) in ${Date.now() - t0} ms — no history replayed`);
+      } catch (e) {
+        cpStats.refused++; cpStats.lastWhy = e.message;
+        logFn(`[l3miner] ${shard}: ${e.message} — ignoring the checkpoint`);
+        state.close(); state = newState();
+        index = -1; epoch = 0; prevRoot = ZERO32; offset = -1; lastBookHash = ZERO32;
+        checkpoint.remove(dir, shard);
+      }
+    }
+    const r = index >= 0 ? { ok: true, replayed: 0, dissented: 0 } : replayJournal();
     if (!r.ok) {
       logFn(`[l3miner] ${r.why} — discarding the local journal and replaying ${shard} from the log`);
       discardJournal();
@@ -452,6 +499,13 @@ export function createMiner({
     } else if (r.replayed) {
       logFn(`[l3miner] ${shard}: replayed ${r.replayed} batch(es) from the journal${r.dissented ? ` (${r.dissented} this miner dissented on)` : ''} → index ${index}, ${state.size} resting, book ${lastBookHash.slice(0, 12)}…`);
     }
+    // However we got here — a checkpoint, a journal replay, or nothing — write a checkpoint for the NEXT restart.
+    // Without this a miner that always had a journal would never produce one, so the first restart after
+    // checkpoints were introduced would be the slow kind forever.
+    // null, not lastBookHash: that is the last EPOCH commitment, which describes the book at the boundary and not
+    // the book as it stands now. The self-check would refuse it, correctly, and the whole point would be lost.
+    if (CHECKPOINT_EVERY && index >= 0 && cpStats.loaded === 0) writeCheckpoint(null);
+
     // what this miner sees as final resumes after what it replayed: the votes topic is re-read from its start (the
     // quorum keys votes by miner), and a vote for a replayed batch — this miner's own dissent on one included — is
     // history, not a fork to halt on again. Before, finality never advanced after a restart (batch 0 is never
@@ -496,7 +550,7 @@ export function createMiner({
       shard: String(shard), miner: account.address, log: log.kind, index, epoch, offset, stalled,
       resting: state.size, bookHash: lastBookHash, prevRoot, finalBook,
       lagSeconds: lagSeconds(), workers: v.workers, votesPending: votesPending.length + votesRetry.length, ...m,
-      journalBytes: jBytes, journalCapped: jCapped, journalMax: JOURNAL_MAX,
+      journalBytes: jBytes, journalCapped: jCapped, journalMax: JOURNAL_MAX, checkpoint: { every: CHECKPOINT_EVERY, ...cpStats },
       perOrderMs: m.orders ? Number((m.verifyMs / m.orders).toFixed(3)) : 0,
       lastVote: lastVote ? { index: lastVote.index, ok: lastVote.ok, fillsRoot: lastVote.fillsRoot, batchRoot: lastVote.batchRoot } : null,
       quorum: quorum ? quorum.status() : null,

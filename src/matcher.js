@@ -87,11 +87,47 @@ export function createBook() {
   function best() { return { bid: bidPrices.length ? bidPrices[0] : null, ask: askPrices.length ? askPrices[0] : null }; }
   function get(hash) { const o = byHash.get(hash); return o ? pub(o) : null; }
   function orders(user = null) { const out = []; for (const o of byHash.values()) if (!user || o.user === user) out.push(pub(o)); return out.sort((a, b) => a.seq - b.seq); }
+
+  /**
+   * restore(snapshot) — rebuild this book from `orders()` taken earlier, preserving every sequence number.
+   *
+   * A miner that catches up from the log re-verifies every signature in it: 19,098 orders on one live shard,
+   * about 6.9 minutes across 73 of them, and hours once the log holds millions. A checkpoint is how a miner —
+   * or a brand-new one, which has no journal at all — gets back to a book it already had without paying that
+   * again, so restoring has to produce the SAME book, not an equivalent one.
+   *
+   * Which means `seq` is restored and never reassigned. It is in the state commitment's leaves (restingLeaf,
+   * keyed on side/price/seq) and in price-time priority, so a book rebuilt with fresh sequence numbers would
+   * hold the same orders and commit to a different root — a dissent on the next epoch boundary, over a book that
+   * is actually right. Orders are inserted in ascending seq, which is what puts each level's FIFO back in
+   * price-time order.
+   *
+   * Refuses rather than repairs: a snapshot missing a seq, holding a hash twice, or with nothing left resting is
+   * a corrupt checkpoint, and the caller's fallback (replay the log) is always available and always correct.
+   */
+  function restore(snapshot) {
+    if (byHash.size) throw new Error('restore: this book already holds orders');
+    const rows = [...(snapshot || [])].sort((a, b) => Number(a.seq) - Number(b.seq));
+    let top = 0;
+    for (const o of rows) {
+      if (!o || typeof o.hash !== 'string') throw new Error('restore: an entry without a hash');
+      const s = Number(o.seq);
+      if (!Number.isInteger(s) || s <= 0) throw new Error(`restore: ${o.hash} has no sequence number`);
+      if (byHash.has(o.hash)) throw new Error(`restore: ${o.hash} appears twice`);
+      const price = BigInt(o.price), size = BigInt(o.size ?? o.remaining), remaining = BigInt(o.remaining ?? o.size);
+      if (!(price > 0n)) throw new Error(`restore: ${o.hash} has no price`);
+      if (!(remaining > 0n) || remaining > size) throw new Error(`restore: ${o.hash} has ${remaining} of ${size} resting`);
+      rest({ hash: o.hash, user: o.user, buy: !!o.buy, price, size, remaining, postOnly: !!o.postOnly, ioc: !!o.ioc, ts: Number(o.ts) || 0, seq: s, prev: null, next: null, level: null });
+      if (s > top) top = s;
+    }
+    if (top > seq) seq = top;              // the next order carries on from where the snapshot left off
+    return rows.length;
+  }
   /// what a taker would get right now, without touching the book (for quotes)
   function preview(buy, price, size) {
     const far = buy ? asks : bids, farPrices = buy ? askPrices : bidPrices; let left = size, cost = 0n, n = 0;
     for (const p of farPrices) { if (buy ? p > price : p < price) break; for (let r = far.get(p).head; r && left > 0n; r = r.next) { const s = r.remaining < left ? r.remaining : left; left -= s; cost += s * p; n++; } if (left === 0n) break; }
     return { filled: size - left, cost, fills: n, avg: size - left > 0n ? cost / (size - left) : null };
   }
-  return { add, cancel, depth, best, get, orders, preview, get size() { return byHash.size; }, get seq() { return seq; } };
+  return { add, cancel, depth, best, get, orders, restore, preview, get size() { return byHash.size; }, get seq() { return seq; } };
 }
