@@ -278,7 +278,10 @@ export async function createKafkaLog({ brokers, clientId = 'rolla-l3', groupPref
       // the same contract as the kafkajs path below and the reason this returns without waiting.
       if (native) {
         const h = native.subscribe(topic, Math.max(0, Number(fromOffset) || 0), handler);
-        return { async close() { h.close(); }, stats: () => h.stats() };
+        // `waiting` keeps the same meaning the kafkajs path gives it (miner.js logs it): the topic is not on the
+        // broker yet. It is a getter, because with the native reader that can become true later — a shard whose
+        // sequencer has not booted — and stop being true without the handle changing.
+        return { async close() { h.close(); }, stats: () => h.stats(), get waiting() { return h.stats().waiting; } };
       }
       else if (!(await exists(topic))) {
         // Wait for it rather than hand back a dead handle. A reader must not create the topic — that is what let a
