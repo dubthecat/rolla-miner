@@ -112,7 +112,7 @@ if (!isMainThread && workerData && workerData.role === ROLE) {
   const TICK = 20;
   let perSec = rate > 0 ? rate : rateMin;
   const fixed = rate > 0;
-  let submitted = 0, carry = 0;
+  let submitted = 0, carry = 0, lastBacklog = 0, lastFinal = -1;
   const t0 = Date.now(), until = t0 + seconds * 1000;
   let lastSample = t0, sampleOps = 0;
 
@@ -125,15 +125,24 @@ if (!isMainThread && workerData && workerData.role === ROLE) {
     const now = Date.now();
     if (now - lastSample >= 1000) {
       const backlog = Math.max(0, sealedIndex - quorum.finalIndex);
+      // what finality actually achieved since the last sample — the only honest ceiling for the submit rate
+      const finalRate = lastFinal >= 0 ? Math.max(0, (quorum.finalIndex - lastFinal)) * batch / ((now - lastSample) / 1000) : 0;
       if (!fixed) {
-        // AIMD: a backlog of a couple of batches is normal pipelining; beyond that finality is losing and the
-        // rate comes down hard. Below it, climb slowly — the point is to settle, not to oscillate.
-        if (backlog > 8) perSec = Math.max(rateMin, Math.floor(perSec * 0.75));
-        else if (backlog <= 3) perSec = Math.min(rateMax, perSec + Math.max(50, Math.floor(perSec * 0.05)));
+        // Steer towards the FINALITY rate, not away from a backlog threshold. The first version of this was a
+        // plain AIMD on the backlog and it oscillated hard: it climbed until finality broke, then cut the rate
+        // multiplicatively while the backlog it had already built kept the condition true, so it sat on the floor
+        // for minutes and reported a rate the venue never had trouble with. Submitting faster than the venue
+        // finalises is what builds a queue, so the queue's DERIVATIVE says whether we are over, and the measured
+        // finality rate says by how much.
+        const growing = backlog > lastBacklog;
+        if (backlog <= 3) perSec = Math.min(rateMax, perSec + Math.max(50, Math.floor(perSec * 0.05)));
+        else if (growing) perSec = Math.max(rateMin, Math.min(Math.floor(perSec * 0.9), Math.floor((finalRate || perSec) * 0.95)));
+        // a backlog that is large but shrinking needs no change: it is already draining at the right rate
       }
+      lastBacklog = backlog; lastFinal = quorum.finalIndex;
       const l = [...lat].sort((a, b) => a - b); lat.length = 0;
       post({ t: 'sample', at: now, elapsed: (now - t0) / 1000, ops: sampleOps, rate: Math.round(sampleOps / ((now - lastSample) / 1000)),
-             target: perSec, submitted, sealedIndex, finalIndex: quorum.finalIndex, backlog, resting: state.stat().resting,
+             target: perSec, submitted, sealedIndex, finalIndex: quorum.finalIndex, backlog, finalRate: Math.round(finalRate), resting: state.stat().resting,
              p50: pct(l, 0.5), p90: pct(l, 0.9), finals: l.length, forks, dissents, halted: !!quorum.halted, rss: Math.round(process.memoryUsage().rss / 1e6) });
       sampleOps = 0; lastSample = now;
     }

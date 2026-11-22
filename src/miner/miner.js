@@ -265,7 +265,7 @@ export function createMiner({
 
   const m = { batches: 0, votes: 0, dissents: 0, badSigs: 0, unchecked: 0, gaps: 0, replayed: 0, verifyMs: 0, applyMs: 0, commitMs: 0, rootMs: 0, orders: 0, fills: 0, lastAt: 0, lastOffset: -1, errors: 0, voteFailures: 0, voteRetried: 0, waitingForLog: false };
   let index = -1, epoch = 0, prevRoot = ZERO32, offset = -1, stalled = null, subOrders = null, subVotes = null, started = false, stopping = false;
-  let lastVote = null, lastBookHash = ZERO32, inflight = Promise.resolve();
+  let lastVote = null, lastBookHash = ZERO32, inflight = Promise.resolve(), warnedDomain = false;
   const recent = new Map();                            // index → { batch, fills }, for challenge proofs
   const keepFills = Number(env.L3_KEEP_FILLS || 64);
 
@@ -352,7 +352,20 @@ export function createMiner({
       if (bookHash !== ZERO32) lastBookHash = bookHash;
       m.batches++; m.lastAt = Date.now(); m.lastOffset = off;
       if (ok) m.votes++;
-      else { m.dissents++; logFn(`[l3miner] DISSENT on ${shard}#${mine.index}: ${why}${myRoot !== batch.batchRoot ? ` (mine ${myRoot.slice(0, 12)}…, theirs ${String(batch.batchRoot).slice(0, 12)}…)` : ' (the roots agree: the batch itself is invalid)'}`); }
+      else {
+        m.dissents++;
+        logFn(`[l3miner] DISSENT on ${shard}#${mine.index}: ${why}${myRoot !== batch.batchRoot ? ` (mine ${myRoot.slice(0, 12)}…, theirs ${String(batch.batchRoot).slice(0, 12)}…)` : ' (the roots agree: the batch itself is invalid)'}`);
+        // A venue cannot produce a batch whose order hash is not the EIP-712 hash of its own order: the sequencer
+        // computed that hash from that order. So the first time a miner sees one, the cause is almost certainly
+        // that the miner is checking against a DIFFERENT domain — a wrong PREDICT_BOOK or CHAIN_ID — and it will
+        // then dissent on every batch forever while looking, from the outside, like a disagreement about the
+        // book. Said once, loudly, with both halves of the domain, because this is the first thing a new miner
+        // gets wrong and the hardest to see: 100 % dissent from batch one, and no other symptom.
+        if (!warnedDomain && !sigs.ok && /not the EIP-712 hash/.test(String(why))) {
+          warnedDomain = true;
+          logFn(`[l3miner] ${shard}: EVERY order in that batch hashes differently here. That is almost never the venue — it is this miner's EIP-712 domain. It is checking against PREDICT_BOOK=${dom.verifyingContract} on chainId ${dom.chainId}; if this venue signs its orders under a different book, set PREDICT_BOOK to that address and restart. Until then this miner dissents on every batch.`);
+        }
+      }
 
       if (journalRoom(mine.index)) {
         append(jBatches, { offset: off, index: mine.index, epoch: mine.epoch, root: myRoot, ok, batch });   // the miner's own copy of the log, with the root IT signed
@@ -582,7 +595,7 @@ export function createMiner({
       lagSeconds: lagSeconds(), workers: v.workers, votesPending: votesPending.length + votesRetry.length, ...m,
       journalBytes: jBytes, journalCapped: jCapped, journalMax: JOURNAL_MAX, checkpoint: { every: CHECKPOINT_EVERY, ...cpStats },
       perOrderMs: m.orders ? Number((m.verifyMs / m.orders).toFixed(3)) : 0,
-      lastVote: lastVote ? { index: lastVote.index, ok: lastVote.ok, fillsRoot: lastVote.fillsRoot, batchRoot: lastVote.batchRoot } : null,
+      lastVote: lastVote ? { index: lastVote.index, ok: lastVote.ok, why: lastVote.why || null, fillsRoot: lastVote.fillsRoot, batchRoot: lastVote.batchRoot } : null,
       quorum: quorum ? quorum.status() : null,
       rewards: rewards ? { accrued: rewards.accruedOf(address).toString(), debt: rewards.debtOf(address).toString(), lifetime: rewards.state().lifetime[address] || null } : null,
       state: state.stat(),
