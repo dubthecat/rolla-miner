@@ -1,6 +1,16 @@
-# The public Redpanda image: its entrypoint is rpk, and `rpk redpanda start …` is the supported way to start a node with
-# addresses on the command line. Advertises the Fly app's public TCP port (a dedicated IPv4 on 9092).
-FROM redpandadata/redpanda:latest
-CMD ["redpanda", "start", "--overprovisioned", "--smp", "3", "--memory", "6G", "--reserve-memory", "0M", "--node-id", "0", "--check=false", "--kafka-addr", "PLAINTEXT://0.0.0.0:9092", "--advertise-kafka-addr", "PLAINTEXT://rolla-l3-broker.fly.dev:9092", "--set", "redpanda.kafka_batch_max_bytes=8388608"]
-# NOTE: `--set` only seeds the FIRST boot. Redpanda keeps cluster properties centrally on the volume, so the limit was applied with
-#   fly ssh console -a rolla-l3-broker -C "rpk cluster config set kafka_batch_max_bytes 8388608"   (2026-10-03; before that, 1.2 MB appends were refused at the 1 MiB default)
+# The L3 log's broker: one Redpanda node, one topic per shard (orders.<shard> and votes.<shard>).
+#
+# PINNED, deliberately. This was `redpandadata/redpanda:latest`, and the live cluster is v26.2.3 — so the next
+# recreate of this machine would have pulled v26.3.x, where `protected_mode` defaults to true and refuses every
+# non-loopback Kafka client. The whole miner fleet would have dropped off the log at the next rebuild, with
+# "Closed connection" as the only symptom. Pin the version, and seed the cluster properties (bootstrap.yaml) so a
+# fresh cluster is correct whatever the version does by default. Moving the pin forward is a deliberate act.
+FROM redpandadata/redpanda:v26.2.3
+USER root
+# read once, when the cluster is first formed; an existing cluster keeps what it has
+COPY bootstrap.yaml /etc/redpanda/.bootstrap.yaml
+COPY start.sh /usr/local/bin/rolla-broker-start
+RUN chmod 0644 /etc/redpanda/.bootstrap.yaml && chmod 0755 /usr/local/bin/rolla-broker-start && \
+    chown redpanda:redpanda /etc/redpanda/.bootstrap.yaml
+USER redpanda
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/rolla-broker-start"]

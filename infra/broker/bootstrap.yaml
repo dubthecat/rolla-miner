@@ -1,0 +1,17 @@
+# Cluster properties for a BRAND NEW broker. Redpanda keeps cluster properties centrally, so this file is read
+# exactly once — when the cluster is first formed — and ignored by an existing one. That makes it safe to ship and
+# the only place these belong: `rpk redpanda start --set redpanda.X` writes the NODE config, which on Redpanda 26.3
+# does not know these names at all and says so in a warning nobody reads ("Unknown property kafka_batch_max_bytes
+# for node config store"), silently dropping the tuning.
+#
+# protected_mode is the one that matters most. From Redpanda 26.3 it defaults to TRUE, and a listener with no
+# authentication then accepts LOOPBACK CONNECTIONS ONLY: every miner is refused with nothing but "Closed
+# connection" on the client side, while the reason sits in the broker's own log. The live broker predates the
+# property — which is exactly why this file exists, because the image used to be :latest and a recreate would have
+# brought the new default in and taken the whole fleet off the log.
+protected_mode: false
+# a sealed batch of 500 orders is well over the 1 MiB default, which refused the append outright
+kafka_batch_max_bytes: 8388608
+auto_create_topics_enabled: true
+# a joining consumer should not wait three seconds for a rebalance window; the miners' reader is group-less anyway
+group_initial_rebalance_delay: 0
