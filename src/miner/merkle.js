@@ -103,15 +103,26 @@ class Words {
       let x = v;
       for (let k = len - 1; k >= 0 && x > 0; k--) { this.b[off + k] = x & 255; x = Math.floor(x / 256); }
     } else {
-      let x = BigInt(v);                                                         // prices and sizes, 1e18-scaled
-      for (let k = len - 1; k >= 0; k--) { this.b[off + k] = Number(x & 0xffn); x >>= 8n; }
+      let x = typeof v === 'bigint' ? v : BigInt(v);                             // prices and sizes, 1e18-scaled
+      // A full 32-byte word used to cost 32 mask-and-shift pairs on a BigInt, and `orderLeaf` does two of them —
+      // 64 BigInt operations a leaf, each one allocating. A 1e18-scaled price or size is under 2^64 (1.8e19)
+      // except at absurd magnitudes, so the common case writes eight bytes and zeroes the rest: a quarter of the
+      // BigInt work for exactly the same bytes, which `merkle.test.mjs` pins against the long way round.
+      if (len === 32 && x >= 0n && x <= 0xffffffffffffffffn) {
+        this.b.fill(0, off, off + 24);
+        for (let k = off + 31; k >= off + 24; k--) { this.b[k] = Number(x & 0xffn); x >>= 8n; }
+      } else {
+        for (let k = len - 1; k >= 0; k--) { this.b[off + k] = Number(x & 0xffn); x >>= 8n; }
+      }
     }
     this.i += 32; return this;
   }
   bool(v) { return this.uint(v ? 1 : 0, 1); }
   address(a) { const u = bytes(a); if (u.length !== 20) throw new Error(`address: ${a}`); this.need(32); this.b.set(u, this.i + 12); this.i += 32; return this; }
-  /// bytes32 occupies the word left-aligned; a shorter bytesN is right-padded. Anything longer is a bug.
-  bytes32(h) { const u = bytes(h); if (u.length > 32) throw new Error(`bytes32 too long: ${u.length}`); this.need(32); this.b.set(u, this.i); this.i += 32; return this; }
+  /// bytes32 occupies the word left-aligned; a shorter bytesN is right-padded. Takes hex OR raw bytes, so a
+  /// caller that already has a hash as bytes (keccak256 answers bytes) need not hex it only for this to parse it
+  /// straight back — that round trip was ~3 µs of every order leaf.
+  bytes32(h) { const u = h instanceof Uint8Array ? h : bytes(h); if (u.length > 32) throw new Error(`bytes32 too long: ${u.length}`); this.need(32); this.b.set(u, this.i); this.i += 32; return this; }
   done() { return this.b.subarray(0, this.i); }
 }
 export { Words as AbiWords };            // rewards.js builds its claim leaves with the same packer
@@ -146,7 +157,9 @@ export function orderLeaf(op) {
     .bool(add ? o.buy : false)
     .uint(add ? o.price : 0).uint(add ? o.size : 0)
     .uint(add ? ((o.postOnly ? 1 : 0) | (o.ioc ? 2 : 0)) : 0, 1)
-    .bytes32(op.sig ? keccak(bytes(op.sig)) : ZERO32);
+    // keccak256 answers BYTES and bytes32 wants bytes: going through `keccak` (which hexes it) only to parse the
+    // hex straight back cost ~3 µs a leaf, and a leaf is 94 % of ordersRootOf.
+    .bytes32(op.sig ? keccak256(bytes(op.sig)) : ZERO32);
   return hex(tagged(LEAF, w.done()));
 }
 /// the leaf of one RESTING order, for the book-state commitment. Price-time identity only: who, which side,
