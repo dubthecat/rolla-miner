@@ -211,3 +211,135 @@ test('what it buys: a restart over a log of real size', async () => {
   assert.ok(warmMs < coldMs, `resuming (${warmMs} ms) was not cheaper than the log (${coldMs} ms)`);
   await resumed.stop();
 });
+
+// ---------------------------------------------------------------------------- a checkpoint from the venue
+// A miner's own file is self-checking, which proves it is intact — not that the book is the one the venue agreed
+// on. A file handed over by the engine needs more than the engine's word, and it does not need a new signature:
+// the sequencer already signed the batch at that index, the batch carries the bookHash of the book as of itself,
+// and `threshold` miners signing agreement on that batch is what finality IS. So the log settles it.
+import * as cpmod from './checkpoint.js';
+import { votesTopic } from './log.js';
+
+/// the venue's own view: a sequencer, a miner that votes, and the batch/vote records in the log
+async function venue(dir, { orders = 80, batchMax = 5, epochBatches = 4 } = {}) {
+  const r = await rig(dir, { orders, batchMax, epochBatches });
+  const voter = minerOn(dir, r, { L3_CHECKPOINT_BATCHES: '0' });
+  await voter.start();
+  const last = r.sealed.at(-1).index;
+  await until(() => voter.index === last, 30000, 'the voting miner to catch up');
+  // a vote has to be IN the log for the verification to find it
+  await until(() => voter.metrics().votes >= 1, 30000, 'a vote in the log');
+  return { ...r, voter, last };
+}
+
+/// the snapshot the engine would serve: the sequencer's own books at the last epoch boundary
+function served(v) {
+  const epochBatch = [...v.sealed].reverse().find((b) => b.bookHash && b.bookHash !== ZERO32);
+  assert.ok(epochBatch, 'the fixture sealed no epoch boundary');
+  const books = new Set([...v.state.books].map(([key, m]) => ({ market: Number(key.split(':')[0]), outcome: Number(key.split(':')[1]), m })));
+  return { snap: cpmod.snapshotOfBooks(books, { shard: SHARD, index: Number(epochBatch.index), epoch: Number(epochBatch.epoch), prevRoot: epochBatch.prevRoot, offset: Number(epochBatch.index), seq: Number(epochBatch.seqTo), bookHash: epochBatch.bookHash, commit: v.state.commit.mode }), epochBatch };
+}
+
+test('a checkpoint the log confirms is accepted; the venue is never taken at its word', async () => {
+  const dir = tmp();
+  const v = await venue(dir);
+  const { snap, epochBatch } = served(v);
+  const ok = await cpmod.verifyAgainstLog(v.log, SHARD, snap, { threshold: 1, ordersTopic, votesTopic });
+  assert.equal(ok.ok, true, `the honest checkpoint was refused: ${ok.why}`);
+  assert.ok(ok.votes >= 1);
+  assert.equal(ok.batchRoot, epochBatch.batchRoot);
+  await v.voter.stop();
+});
+
+test('a forged checkpoint is refused: the book it claims is not the book the batch committed to', async () => {
+  const dir = tmp();
+  const v = await venue(dir);
+  const { snap } = served(v);
+  const cases = [
+    // the classic attack: a real batch index, a book of someone's choosing
+    [{ ...snap, bookHash: '0x' + 'de'.repeat(32) }, /commits to|the checkpoint says/],
+    // a book that never had a commitment: not an epoch boundary
+    [{ ...snap, index: snap.index + 1 }, /no batch|carries no book commitment|commits to/],
+    // a batch that does not exist
+    [{ ...snap, index: 99999 }, /no batch 99999/],
+    [{ ...snap, index: -1 }, /index -1/],
+    // another shard's batch
+    [{ ...snap, shard: '404' }, /no batch/],
+  ];
+  for (const [bad, why] of cases) {
+    const r = await cpmod.verifyAgainstLog(v.log, bad.shard === '404' ? '404' : SHARD, bad, { threshold: 1, ordersTopic, votesTopic });
+    assert.equal(r.ok, false, `this forgery was accepted: ${JSON.stringify({ index: bad.index, bookHash: String(bad.bookHash).slice(0, 10) })}`);
+    assert.match(r.why, why);
+  }
+  await v.voter.stop();
+});
+
+test('a checkpoint the quorum has not reached the threshold on is refused', async () => {
+  const dir = tmp();
+  const v = await venue(dir);
+  const { snap } = served(v);
+  // one miner voted; ask for three
+  const r = await cpmod.verifyAgainstLog(v.log, SHARD, snap, { threshold: 3, ordersTopic, votesTopic });
+  assert.equal(r.ok, false);
+  assert.match(r.why, /agreeing vote\(s\), threshold is 3/);
+  await v.voter.stop();
+});
+
+test('a joining miner with no journal and no checkpoint of its own starts from the venue\'s', async () => {
+  // The whole point: a NEW miner. No journal, no checkpoint, nothing but the log and an engine to ask.
+  const dir = tmp();
+  const v = await venue(dir);
+  const { snap } = served(v);
+  // stand up the engine's route, exactly as server.js answers it
+  const http = await import('node:http');
+  const srv = http.createServer((req, res) => {
+    if (req.url.startsWith('/v1/l3/checkpoint')) { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify(snap)); }
+    res.writeHead(404); res.end();
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  const said = [];
+  const fresh = createMiner({
+    shard: SHARD, log: v.log, account: privateKeyToAccount(generatePrivateKey()), domain: v.domain,
+    dir: path.join(dir, 'joiner'), workers: 0, sequencers: [v.seqAcct.address], threshold: 1, watchVotes: false,
+    env: { CHAIN_ID: '46630', L3_CHECKPOINT_BATCHES: '20', L3_CHECKPOINT_URL: url }, logger: (m) => said.push(String(m)),
+  });
+  try {
+    await fresh.start();
+    const took = said.find((l) => /took a checkpoint at batch/.test(l));
+    assert.ok(took, `it did not take the venue's checkpoint: ${said.join(' | ')}`);
+    assert.match(took, /the log confirms its book commitment/);
+    assert.equal(fresh.status().checkpoint.fetched, 1);
+    assert.equal(fresh.status().replayed, 0, 'it replayed history it was given a shortcut past');
+    await until(() => fresh.index === v.last, 30000, 'the joining miner to reach the head');
+    assert.equal(fresh.state.bookHash(), v.state.bookHash(), 'the joining miner reached a different book');
+    assert.equal(fresh.status().dissents, 0, 'it dissented after joining from a checkpoint');
+  } finally { await fresh.stop(); srv.close(); await v.voter.stop(); }
+});
+
+test('an engine serving a forged checkpoint gets ignored, and the miner catches up anyway', async () => {
+  const dir = tmp();
+  const v = await venue(dir);
+  const { snap } = served(v);
+  const http = await import('node:http');
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ...snap, bookHash: '0x' + 'ff'.repeat(32) }));   // a book of its own choosing
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const said = [];
+  const fresh = createMiner({
+    shard: SHARD, log: v.log, account: privateKeyToAccount(generatePrivateKey()), domain: v.domain,
+    dir: path.join(dir, 'joiner2'), workers: 0, sequencers: [v.seqAcct.address], threshold: 1, watchVotes: false,
+    env: { CHAIN_ID: '46630', L3_CHECKPOINT_BATCHES: '20', L3_CHECKPOINT_URL: `http://127.0.0.1:${srv.address().port}` }, logger: (m) => said.push(String(m)),
+  });
+  try {
+    await fresh.start();
+    assert.ok(said.some((l) => /no usable checkpoint from the venue/.test(l)), `the forgery was accepted: ${said.join(' | ')}`);
+    assert.equal(fresh.status().checkpoint.fetched, 0);
+    assert.equal(fresh.status().checkpoint.fetchRefused, 1);
+    // and it still gets to the right book the honest way
+    await until(() => fresh.index === v.last, 60000, 'the fallback to catch up');
+    assert.equal(fresh.state.bookHash(), v.state.bookHash());
+  } finally { await fresh.stop(); srv.close(); await v.voter.stop(); }
+});

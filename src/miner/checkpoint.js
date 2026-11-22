@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { writeState, readState } from '../state-file.js';
+import { ZERO32 } from './merkle.js';
 
 export const CHECKPOINT_VERSION = 1;
 export const fileOf = (dir, shard) => path.join(dir, `${shard}.checkpoint.json`);
@@ -104,4 +105,71 @@ export function restore(state, snap, { commitMode = null } = {}) {
   if (got !== snap.bookHash) throw new Error(`checkpoint: the restored book commits to ${String(got).slice(0, 12)}…, the file says ${String(snap.bookHash).slice(0, 12)}…`);
   if (resting !== Number(snap.resting)) throw new Error(`checkpoint: restored ${resting} resting order(s), the file says ${snap.resting}`);
   return { resting, index: Number(snap.index), epoch: Number(snap.epoch), prevRoot: snap.prevRoot, offset: Number(snap.offset) };
+}
+
+/**
+ * snapshotOfBooks(books, { … }) — the same file, built from the ENGINE's books rather than a miner's shard state.
+ * The engine wraps each matcher as `.m` on a `{ market, outcome, token, m, trades }` record and keeps the shard's
+ * op counter on the sequencer's state, so the pieces arrive separately; the format is identical, which is the
+ * point — a miner cannot tell (and must not care) whose book it restored.
+ */
+export function snapshotOfBooks(books, { shard, index, epoch, prevRoot, offset, seq, bookHash, commit = null }) {
+  const out = {};
+  let resting = 0;
+  for (const b of books) {
+    const rows = b.m.orders();
+    if (!rows.length) continue;
+    out[`${Number(b.market)}:${Number(b.outcome)}`] = rows.map(rowOf);
+    resting += rows.length;
+  }
+  return {
+    v: CHECKPOINT_VERSION, shard: String(shard), index: Number(index), epoch: Number(epoch),
+    prevRoot, offset: Number(offset), seq: Number(seq) || 0, commit,
+    bookHash, resting, books: out, at: Date.now(),
+  };
+}
+
+/**
+ * verifyAgainstLog(log, shard, snap, { threshold }) → { ok, why, votes, batchRoot }
+ *
+ * What makes a checkpoint from SOMEONE ELSE safe to start from. A miner's own file is self-checking — it carries
+ * the bookHash the restored book must reproduce — but that only proves the file is intact, not that the book is
+ * the one the venue agreed on. A file handed over by the engine needs more than the engine's word for it.
+ *
+ * It does not need a new signature, because the two that matter already exist in the log:
+ *
+ *   the SEQUENCER signed the batch at `index`, and that batch carries the bookHash of the book as of itself;
+ *   the MINERS signed votes for that batch, and `threshold` of them agreeing on its root is what finality IS.
+ *
+ * So: read the batch, check the checkpoint commits to the same book the batch does, and count the agreeing votes.
+ * A checkpoint that passes is a book the venue finalised — and one that fails is simply not used, which costs a
+ * log replay and nothing else. The engine is never trusted here; the log is.
+ */
+export async function verifyAgainstLog(log, shard, snap, { threshold = 2, ordersTopic, votesTopic } = {}) {
+  if (!snap) return { ok: false, why: 'nothing to verify' };
+  const index = Number(snap.index);
+  if (!Number.isInteger(index) || index < 0) return { ok: false, why: `index ${snap.index}` };
+  // Offsets and indices coincide for a single-sequencer shard — one append per batch (sequencer.js resume()) —
+  // but the batch is matched by its own `index`, not by where it sat, so a log that ever differs is caught here
+  // rather than trusted.
+  let rows = [];
+  try { rows = await log.read(ordersTopic(shard), Math.max(0, index), 8); } catch (e) { return { ok: false, why: `cannot read the log: ${e.message}` }; }
+  const batch = rows.map((r) => r.value).find((v) => v && Number(v.index) === index && String(v.shard) === String(shard));
+  if (!batch) return { ok: false, why: `the log has no batch ${index} for shard ${shard}` };
+  if (String(batch.bookHash || '') !== String(snap.bookHash || '')) {
+    return { ok: false, why: `batch ${index} commits to ${String(batch.bookHash).slice(0, 12)}…, the checkpoint says ${String(snap.bookHash).slice(0, 12)}…` };
+  }
+  if (!batch.bookHash || batch.bookHash === ZERO32) return { ok: false, why: `batch ${index} carries no book commitment (not an epoch boundary)` };
+  // and the quorum's own answer about that batch
+  let votes = [];
+  try { votes = await log.read(votesTopic(shard), 0, 100000); } catch (e) { return { ok: false, why: `cannot read the votes: ${e.message}` }; }
+  const agreed = new Set();
+  for (const { value: v } of votes) {
+    if (!v || Number(v.index) !== index) continue;
+    if (v.ok === false) continue;
+    if (String(v.batchRoot) !== String(batch.batchRoot)) continue;
+    if (v.miner) agreed.add(String(v.miner).toLowerCase());
+  }
+  if (agreed.size < threshold) return { ok: false, why: `batch ${index} has ${agreed.size} agreeing vote(s), threshold is ${threshold}`, votes: agreed.size };
+  return { ok: true, why: null, votes: agreed.size, batchRoot: batch.batchRoot };
 }

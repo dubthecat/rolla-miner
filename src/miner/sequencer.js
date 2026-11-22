@@ -27,6 +27,7 @@ import { signDigest } from './verify.js';
 import { createShardState } from './miner.js';
 import { createCommitState } from './commit-state.js';
 import { createQuorum } from './quorum.js';
+import * as checkpoint from './checkpoint.js';
 import { createLog, ordersTopic, votesTopic } from './log.js';
 import { rewardsFromEnv } from './rewards.js';
 import { serializeL3Order } from '../desk.js';
@@ -285,6 +286,9 @@ export function createSequencerRig({
   const shardOf = (market, outcome) => (byOutcome ? `${Number(market)}-${Number(outcome)}` : String(Number(market)));
 
   const shards = new Map();     // shard → { seq, quorum, sub, books, state, rewards, closedEpoch, deferred, reconcile }
+  // where the per-shard checkpoints live, for /v1/l3/checkpoint to serve. Off with L3_RIG_CHECKPOINTS=0.
+  const cpDir = env.L3_RIG_CHECKPOINTS === '0' ? null : path.join(dir || path.join(env.L3_DIR || (env.DATA_DIR ? path.join(env.DATA_DIR, 'l3') : '.l3'), 'log'), 'checkpoints');
+  const cpStats = { written: 0, lastIndex: -1, lastWhy: null };
   let logImpl = null, started = null, stopping = false;
   const stats = { finalized: 0, forks: 0, records: 0, skipped: 0, deferred: 0, reconciled: 0, unreconciled: 0, rebuilt: 0, epochsClosed: 0 };
   const PAGE = Math.max(1, Number(env.L3_RECONCILE_PAGE || 1000));
@@ -533,7 +537,23 @@ export function createSequencerRig({
       log: { kind: 'deferred', append: async (t, v) => (await ready()).append(t, v), appendMany: async (t, vs) => (await ready()).appendMany(t, vs), offset: async (t) => (await ready()).offset(t), read: async (t, f, l) => (await ready()).read(t, f, l) },
       appendBytes: Number(env.L3_APPEND_BYTES || 6 << 20),
       account: acct, batchMs, batchMax, epochBatches, logger: logFn, newBook,
-      onSealed: (batch) => { quorum.announce(batch); },
+      onSealed: (batch) => {
+        quorum.announce(batch);
+        // At an epoch boundary the batch carries the book commitment, which makes this the one moment where the
+        // engine's books, the index, the epoch, the chain root and the log offset all describe each other. A
+        // checkpoint written here is one a joining miner can CHECK rather than trust: the batch is signed by this
+        // sequencer and the miners vote on it, so `checkpoint.verifyAgainstLog` can confirm the book from the log
+        // alone (see checkpoint.js). Without it a brand-new miner has to re-verify every signature the shard ever
+        // took — 19,098 orders on one live shard, hours once a shard has seen millions.
+        if (cpDir && batch.bookHash && batch.bookHash !== ZERO32) {
+          try {
+            const snap = checkpoint.snapshotOfBooks(books, { shard, index: Number(batch.index), epoch: Number(batch.epoch),
+              prevRoot: batch.prevRoot || ZERO32, offset: Number(batch.index), seq: Number(batch.seqTo), bookHash: batch.bookHash, commit: cs.mode });
+            checkpoint.write(cpDir, shard, snap);
+            cpStats.written++; cpStats.lastIndex = Number(batch.index);
+          } catch (e) { cpStats.lastWhy = e.message; logFn(`[l3rig] ${shard}: could not write a checkpoint (${e.message})`); }
+        }
+      },
       rewardsRoot: () => ({ root: rewards.epochRootOf(s0.closedEpoch), epoch: s0.closedEpoch }),
       onEpoch,
     });
@@ -648,10 +668,15 @@ export function createSequencerRig({
     shard(shard) { return shards.get(shard) || null; },
     /// the sorted finality signatures a finalized batch has now (quorum.js finalSigsOf), or null
     finalSigsOf(shard, index) { const s = shards.get(String(shard)); return s ? s.quorum.finalSigsOf(index) : null; },
+    /// The latest checkpoint this rig wrote for a shard — the book at a finalised epoch boundary, which a joining
+    /// miner can check against the log instead of taking anyone's word for it (checkpoint.verifyAgainstLog).
+    checkpointOf(shard) { return cpDir ? checkpoint.read(cpDir, String(shard)) : null; },
+    get checkpointDir() { return cpDir; },
     status() {
       const out = { log: logImpl ? logImpl.kind : logDown.at ? 'unavailable' : 'starting', logError: logDown.error, logAttempts: logDown.attempts, dir: logImpl?.dir || null, threshold, ...stats, shards: {} };
       for (const [k, s] of shards) out.shards[k] = { sequencer: s.seq.status(), quorum: s.quorum.status(), rewardsEpochClosed: s.closedEpoch, deferred: s.deferred.length, reconcile: s.reconcile };
       out.retirement = { enabled: RETIRE && typeof retirableOf === 'function', everyMs: RETIRE_MS, perRun: RETIRE_PER_RUN, ...rstats };
+      out.checkpoints = { dir: cpDir, ...cpStats };
       return out;
     },
     async stop() {

@@ -235,7 +235,11 @@ export function createMiner({
   // replaying, which is the difference between seconds and the ~6.9 minutes of secp256k1 this fleet pays per
   // restart today — and the difference between possible and not once a shard's log holds millions of orders.
   const CHECKPOINT_EVERY = Math.max(0, Number(env.L3_CHECKPOINT_BATCHES ?? 200));
-  const cpStats = { written: 0, loaded: 0, refused: 0, lastAt: null, lastIndex: -1, lastWhy: null, ms: 0 };
+  const cpStats = { written: 0, loaded: 0, refused: 0, fetched: 0, fetchRefused: 0, fetchMs: 0, lastAt: null, lastIndex: -1, lastWhy: null, ms: 0 };
+  // where to ask for one when this miner has none of its own (the engine's /v1/l3/checkpoint). L3_ENGINE_URL by
+  // default on a fleet member, so joining is cheap without being configured for.
+  const CHECKPOINT_URL = env.L3_CHECKPOINT_URL || env.L3_ENGINE_URL || '';
+  const CHECKPOINT_FETCH_MS = Math.max(1000, Number(env.L3_CHECKPOINT_FETCH_MS || 15000));
   function writeCheckpoint(bookHash) {
     if (!dir || !CHECKPOINT_EVERY) return;
     const t0 = Date.now();
@@ -473,7 +477,28 @@ export function createMiner({
     // A checkpoint first: it is O(resting) where the journal is O(ops) and the log is O(ops) PLUS a signature
     // check apiece. It is self-checking — the file carries the bookHash the restored book has to reproduce — and
     // a refusal is not a problem, it just means doing what we did before.
-    const cp = CHECKPOINT_EVERY && dir ? checkpoint.read(dir, shard) : null;
+    let cp = CHECKPOINT_EVERY && dir ? checkpoint.read(dir, shard) : null;
+    // No local one? Ask the venue for the book at a finalised epoch boundary, and then CHECK it: the batch it
+    // names is signed by the sequencer and voted on by the miners, so the log settles whether this book is the
+    // one the venue agreed on. Nobody's word is taken for it — a checkpoint that does not line up is simply not
+    // used, which costs a log replay and nothing else. This is what makes a BRAND-NEW miner cheap to start: it
+    // otherwise re-verifies every signature the shard ever took.
+    if (!cp && CHECKPOINT_URL) {
+      try {
+        const t0 = Date.now();
+        const r = await fetch(`${CHECKPOINT_URL.replace(/\/+$/, '')}/v1/l3/checkpoint?shard=${encodeURIComponent(shard)}`, { signal: AbortSignal.timeout(CHECKPOINT_FETCH_MS), headers: { accept: 'application/json' } });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const got = await r.json();
+        const v = await checkpoint.verifyAgainstLog(log, shard, got, { threshold, ordersTopic, votesTopic });
+        if (!v.ok) throw new Error(v.why);
+        cp = got;
+        cpStats.fetched++; cpStats.fetchMs = Date.now() - t0;
+        logFn(`[l3miner] ${shard}: took a checkpoint at batch ${got.index} from ${CHECKPOINT_URL} — the log confirms its book commitment and ${v.votes} miner(s) voted for that batch`);
+      } catch (e) {
+        cpStats.fetchRefused++; cpStats.lastWhy = e.message;
+        logFn(`[l3miner] ${shard}: no usable checkpoint from the venue (${e.message}) — catching up from the log`);
+      }
+    }
     if (cp) {
       try {
         const t0 = Date.now();
