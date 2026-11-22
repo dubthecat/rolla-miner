@@ -19,8 +19,10 @@ export function spawnMiners({ shards, keys, brokers, sequencers, threshold, work
     const start = () => {
       m.child = spawn(process.execPath, [path.join(here, '..', 'src', 'miner', 'run.mjs')], {
         stdio: ['ignore', 'inherit', 'inherit'],
-        env: { ...env, ...extra, L3_LOG: 'kafka', L3_KAFKA_BROKERS: brokers, L3_SHARD: String(shard), L3_MINER_KEY: keys[i], L3_SEQUENCERS: sequencers, L3_THRESHOLD: String(threshold),
-               L3_VERIFY_WORKERS: String(workers), PORT: String(port), DATA_DIR: path.join(dataDir, `m-${shard}`) },
+        // `extra` comes LAST so it can actually override — it could not before, which made a file-log run (the
+        // only way to exercise a miner host without a broker) impossible to ask for.
+        env: { ...env, L3_LOG: 'kafka', L3_KAFKA_BROKERS: brokers, L3_SHARD: String(shard), L3_MINER_KEY: keys[i], L3_SEQUENCERS: sequencers, L3_THRESHOLD: String(threshold),
+               L3_VERIFY_WORKERS: String(workers), PORT: String(port), DATA_DIR: path.join(dataDir, `m-${shard}`), ...extra },
       });
       m.child.on('exit', (code, sig) => {
         m.exits++; onLog(`[sim-miners] miner ${shard} (port ${port}) exited (${code ?? sig}), exit #${m.exits}`);

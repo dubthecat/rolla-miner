@@ -102,10 +102,19 @@ export function createBook() {
    * is actually right. Orders are inserted in ascending seq, which is what puts each level's FIFO back in
    * price-time order.
    *
-   * Refuses rather than repairs: a snapshot missing a seq, holding a hash twice, or with nothing left resting is
-   * a corrupt checkpoint, and the caller's fallback (replay the log) is always available and always correct.
+   * `seq` (the option) is the book's own counter, and it is NOT `max(resting seq)`: `add` bumps it, every fill
+   * bumps it, and `cancel` bumps it while leaving nothing behind in the resting set at all. So a counter inferred
+   * from the orders is systematically too LOW, the next order takes a sequence number the sequencer already spent,
+   * and the book commits to a different resting leaf — a dissent at the next epoch boundary over a book that is
+   * otherwise identical, and one that no self-check at restore time can see, because the restored book's own root
+   * is right. It is carried explicitly for that reason. Passing it also allows a snapshot with nothing resting,
+   * which is a real state a book can be in and still have spent thousands of sequence numbers.
+   *
+   * Refuses rather than repairs: a snapshot missing a seq, holding a hash twice, or a counter below the newest
+   * order it restored is a corrupt checkpoint, and the caller's fallback (replay the log) is always available and
+   * always correct.
    */
-  function restore(snapshot) {
+  function restore(snapshot, { seq: counter = null } = {}) {
     if (byHash.size) throw new Error('restore: this book already holds orders');
     const rows = [...(snapshot || [])].sort((a, b) => Number(a.seq) - Number(b.seq));
     let top = 0;
@@ -120,7 +129,12 @@ export function createBook() {
       rest({ hash: o.hash, user: o.user, buy: !!o.buy, price, size, remaining, postOnly: !!o.postOnly, ioc: !!o.ioc, ts: Number(o.ts) || 0, seq: s, prev: null, next: null, level: null });
       if (s > top) top = s;
     }
-    if (top > seq) seq = top;              // the next order carries on from where the snapshot left off
+    if (counter != null) {
+      const c = Number(counter);
+      if (!Number.isInteger(c) || c < 0) throw new Error(`restore: seq counter ${counter}`);
+      if (c < top) throw new Error(`restore: seq counter ${c} is below the newest restored order's ${top}`);
+      seq = c;                             // exactly where the book was, cancels and fills included
+    } else if (top > seq) seq = top;       // older checkpoints: the best that can be inferred
     return rows.length;
   }
   /// what a taker would get right now, without touching the book (for quotes)

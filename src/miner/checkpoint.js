@@ -22,8 +22,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { writeState, readState } from '../state-file.js';
 import { ZERO32 } from './merkle.js';
+import { recoverDigestSigner } from './verify.js';
 
-export const CHECKPOINT_VERSION = 1;
+export const CHECKPOINT_VERSION = 2;   // 2 carries each book's seq COUNTER; a v1 file restores it too low
 export const fileOf = (dir, shard) => path.join(dir, `${shard}.checkpoint.json`);
 
 /// bigints and the matcher's node fields do not belong in JSON; this is the wire form of one resting order
@@ -37,10 +38,14 @@ const orderOf = (r) => ({ hash: r.h, user: r.u, buy: !!r.b, price: BigInt(r.p), 
  */
 export function snapshot(state, { shard, index, epoch, prevRoot, offset, bookHash = null }) {
   const books = {};
+  const counters = {};
   let resting = 0;
   for (const [key, book] of state.books) {
+    // EVERY book's counter, resting or not. A book with nothing left in it has still spent every sequence number
+    // its adds, fills and cancels consumed, and the next order must carry on from there or the commitment moves.
+    if (typeof book.seq === 'number') counters[key] = book.seq;
     const rows = book.orders();
-    if (!rows.length) continue;                       // an empty book restores to nothing
+    if (!rows.length) continue;                       // nothing resting: the counter above is all there is to keep
     books[key] = rows.map(rowOf);
     resting += rows.length;
   }
@@ -51,7 +56,7 @@ export function snapshot(state, { shard, index, epoch, prevRoot, offset, bookHas
     // the root the restored book has to reproduce. Taken from the caller when it already has it for this batch,
     // so the file commits to the same word the miner voted on rather than one computed a moment later.
     bookHash: bookHash || state.bookHash(),
-    resting, books, at: Date.now(),
+    resting, books, counters, at: Date.now(),
   };
 }
 
@@ -92,12 +97,18 @@ export function restore(state, snap, { commitMode = null } = {}) {
   // misleading message — this is exactly what a cluster-wide L3_COMMIT change looks like from here.
   if (commitMode && snap.commit && snap.commit !== commitMode) throw new Error(`checkpoint: written under L3_COMMIT=${snap.commit}, this miner runs ${commitMode}`);
   let resting = 0;
-  for (const [key, rows] of Object.entries(snap.books || {})) {
+  const counters = snap.counters || {};
+  // the union: a book may appear only in `counters` (nothing resting, a counter worth keeping) or only in
+  // `books` (a v1 file, which has no counters at all — then the matcher infers, as it used to)
+  const keys = new Set([...Object.keys(snap.books || {}), ...Object.keys(counters)]);
+  for (const key of keys) {
+    const rows = (snap.books || {})[key] || [];
     const [market, outcome] = String(key).split(':').map(Number);
     if (!Number.isFinite(market) || !Number.isFinite(outcome)) throw new Error(`checkpoint: book key ${key}`);
     const book = state.bookFor(market, outcome);
     if (typeof book.restore !== 'function') throw new Error('checkpoint: this book backend has no restore (the native book does not yet)');
-    resting += book.restore(rows.map(orderOf));
+    const counter = Object.prototype.hasOwnProperty.call(counters, key) ? Number(counters[key]) : null;
+    resting += book.restore(rows.map(orderOf), { seq: counter });
   }
   state.restoreSeq(Number(snap.seq) || 0);
   state.seedCommit();
@@ -115,17 +126,20 @@ export function restore(state, snap, { commitMode = null } = {}) {
  */
 export function snapshotOfBooks(books, { shard, index, epoch, prevRoot, offset, seq, bookHash, commit = null }) {
   const out = {};
+  const counters = {};
   let resting = 0;
   for (const b of books) {
+    const key = `${Number(b.market)}:${Number(b.outcome)}`;
+    if (typeof b.m.seq === 'number') counters[key] = b.m.seq;
     const rows = b.m.orders();
     if (!rows.length) continue;
-    out[`${Number(b.market)}:${Number(b.outcome)}`] = rows.map(rowOf);
+    out[key] = rows.map(rowOf);
     resting += rows.length;
   }
   return {
     v: CHECKPOINT_VERSION, shard: String(shard), index: Number(index), epoch: Number(epoch),
     prevRoot, offset: Number(offset), seq: Number(seq) || 0, commit,
-    bookHash, resting, books: out, at: Date.now(),
+    bookHash, resting, books: out, counters, at: Date.now(),
   };
 }
 
@@ -144,8 +158,20 @@ export function snapshotOfBooks(books, { shard, index, epoch, prevRoot, offset, 
  * So: read the batch, check the checkpoint commits to the same book the batch does, and count the agreeing votes.
  * A checkpoint that passes is a book the venue finalised — and one that fails is simply not used, which costs a
  * log replay and nothing else. The engine is never trusted here; the log is.
+ *
+ * BOOTSTRAP. There is one state where counting votes cannot work, and the live venue was in it: a shard whose log
+ * has been trimmed at the front by retention cannot be replayed into the engine's book at all (the per-book
+ * sequence counters are gone with the prefix), so every miner dissents at every epoch boundary that has anything
+ * resting, no batch ever reaches the threshold, and the checkpoint that would fix it is refused for want of the
+ * votes that it is the cure for. On 2026-11-22 that was six of 46 live shards, halted with finalIndex -1.
+ *
+ * `bootstrap` breaks it with the other signature in the log rather than with trust in the engine: the SEQUENCER
+ * signed `batchRoot`, and batchRoot commits to the bookHash this checkpoint has to match. Accepting that is
+ * strictly less than the miner already does — it applies every batch that signature covers — and it is not a
+ * substitute for the quorum, which starts counting again at the very next batch. It is allowed only when the
+ * shard has no finality to lose (`finalIndex < 0`) and only against an explicit sequencer allowlist.
  */
-export async function verifyAgainstLog(log, shard, snap, { threshold = 2, ordersTopic, votesTopic } = {}) {
+export async function verifyAgainstLog(log, shard, snap, { threshold = 2, ordersTopic, votesTopic, sequencers = null, bootstrap = false } = {}) {
   if (!snap) return { ok: false, why: 'nothing to verify' };
   const index = Number(snap.index);
   if (!Number.isInteger(index) || index < 0) return { ok: false, why: `index ${snap.index}` };
@@ -170,6 +196,16 @@ export async function verifyAgainstLog(log, shard, snap, { threshold = 2, orders
     if (String(v.batchRoot) !== String(batch.batchRoot)) continue;
     if (v.miner) agreed.add(String(v.miner).toLowerCase());
   }
-  if (agreed.size < threshold) return { ok: false, why: `batch ${index} has ${agreed.size} agreeing vote(s), threshold is ${threshold}`, votes: agreed.size };
-  return { ok: true, why: null, votes: agreed.size, batchRoot: batch.batchRoot };
+  if (agreed.size >= threshold) return { ok: true, why: null, votes: agreed.size, batchRoot: batch.batchRoot };
+  if (bootstrap) {
+    // the sequencer's own signature over the root that commits to this book
+    const allow = new Set([...(sequencers || [])].map((a) => String(a).toLowerCase()));
+    if (!allow.size) return { ok: false, why: `batch ${index} has ${agreed.size} agreeing vote(s) and bootstrap has no sequencer allowlist to check against`, votes: agreed.size };
+    const who = batch.sig ? recoverDigestSigner(batch.batchRoot, batch.sig) : null;
+    if (who && allow.has(String(who).toLowerCase())) {
+      return { ok: true, why: `bootstrap: ${agreed.size} agreeing vote(s), below the threshold of ${threshold}, accepted on the sequencer's signature over batch ${index}`, votes: agreed.size, batchRoot: batch.batchRoot, bootstrap: true, sequencer: who };
+    }
+    return { ok: false, why: `batch ${index} has ${agreed.size} agreeing vote(s) and is not signed by a known sequencer (${who || 'no signature'})`, votes: agreed.size };
+  }
+  return { ok: false, why: `batch ${index} has ${agreed.size} agreeing vote(s), threshold is ${threshold}`, votes: agreed.size };
 }

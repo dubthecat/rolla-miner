@@ -239,6 +239,7 @@ export function createMiner({
   // where to ask for one when this miner has none of its own (the engine's /v1/l3/checkpoint). L3_ENGINE_URL by
   // default on a fleet member, so joining is cheap without being configured for.
   const CHECKPOINT_URL = env.L3_CHECKPOINT_URL || env.L3_ENGINE_URL || '';
+  const CHECKPOINT_BOOTSTRAP = String(env.L3_CHECKPOINT_BOOTSTRAP ?? '1') !== '0';
   const CHECKPOINT_FETCH_MS = Math.max(1000, Number(env.L3_CHECKPOINT_FETCH_MS || 15000));
   function writeCheckpoint(bookHash) {
     if (!dir || !CHECKPOINT_EVERY) return;
@@ -489,7 +490,11 @@ export function createMiner({
         const r = await fetch(`${CHECKPOINT_URL.replace(/\/+$/, '')}/v1/l3/checkpoint?shard=${encodeURIComponent(shard)}`, { signal: AbortSignal.timeout(CHECKPOINT_FETCH_MS), headers: { accept: 'application/json' } });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const got = await r.json();
-        const v = await checkpoint.verifyAgainstLog(log, shard, got, { threshold, ordersTopic, votesTopic });
+        // `bootstrap` is for the one state votes cannot settle: a shard whose log was trimmed at the front, where
+        // every miner dissents and so no batch can reach the threshold. Only when this shard has no finality at
+        // all, and only against the sequencer allowlist this miner already applies batches under.
+        const canBootstrap = CHECKPOINT_BOOTSTRAP && allowSeq && (!quorum || quorum.finalIndex < 0);
+        const v = await checkpoint.verifyAgainstLog(log, shard, got, { threshold, ordersTopic, votesTopic, bootstrap: canBootstrap, sequencers: allowSeq ? [...allowSeq] : null });
         if (!v.ok) throw new Error(v.why);
         cp = got;
         cpStats.fetched++; cpStats.fetchMs = Date.now() - t0;

@@ -201,7 +201,13 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
     const halted = e.miner.quorum ? !!e.miner.quorum.halted : false;
     const disagreeing = !!(s.lastVote && s.lastVote.ok === false);
     const ok = !s.stalled && !disagreeing && !halted && voteBacklog === 0;
-    return { shard, ok, source: e.source, since: e.since, index: s.index, epoch: s.epoch, offset: s.offset, stalled: s.stalled, batches: s.batches, votes: s.votes, dissents: s.dissents, disagreeing,
+    // WHY, not just that. A halted shard used to report `halted: true` and a dissent count, and the reason —
+    // which decides the remedy, because "roots differ" has four quite different causes — existed only as a log
+    // line on the machine. On 2026-11-22 that cost a day of guessing about six live shards.
+    const why = s.lastVote && s.lastVote.ok === false ? String(s.lastVote.why || 'roots differ') : null;
+    const q = halted && e.miner.quorum ? e.miner.quorum.status() : null;
+    const fork = q && q.lastFork ? { index: q.lastFork.index, sticky: !!q.lastFork.sticky, forks: q.forks } : null;
+    return { shard, ok, source: e.source, since: e.since, index: s.index, epoch: s.epoch, offset: s.offset, stalled: s.stalled, batches: s.batches, votes: s.votes, dissents: s.dissents, disagreeing, why, fork,
              resting: s.resting, lagSeconds: s.lagSeconds, votesPending: s.votesPending, voteBacklog, journalBytes: s.journalBytes ?? null, journalCapped: s.journalCapped ?? null,
              finalIndex: e.miner.quorum ? e.miner.quorum.finalIndex : null, halted, errors: s.errors };
   }

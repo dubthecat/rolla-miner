@@ -343,3 +343,127 @@ test('an engine serving a forged checkpoint gets ignored, and the miner catches 
     assert.equal(fresh.state.bookHash(), v.state.bookHash());
   } finally { await fresh.stop(); srv.close(); await v.voter.stop(); }
 });
+
+// --------------------------------------------------------------------------------- the counter a checkpoint forgot
+// Found on the live venue, 2026-11-22. Six of 46 shards sat halted with `finalIndex: -1`, dissenting at 173 of
+// 1,071 epoch boundaries — and ONLY on `bookHash`; ordersRoot and fillsRoot agreed on every batch in the log
+// (scripts/ops/l3-divergence.mjs). The cause: retention had trimmed the front of those shards' logs, so a miner
+// replaying what was left started each book's sequence counter at zero while the engine's was in the thousands,
+// and `restingLeaf` is keyed on side/price/SEQ.
+//
+// Checkpoints are the answer to that — except they had the same hole one step further along. `matcher.restore`
+// inferred the counter as `max(resting seq)`, and the counter is spent by `add`, by every fill AND by `cancel`,
+// which leaves nothing behind in the resting set. So a restored book's counter came back too low, the next order
+// took a sequence number the sequencer had already spent, and the shard dissented at the following boundary.
+//
+// Nothing at restore time can catch it: the restored book's own root is correct, which is why these tests check
+// the NEXT boundary rather than the restore itself.
+const E = 10n ** 18n;
+const opAdd = (hash, { buy = true, price = 50n, market = 909, outcome = 0 } = {}) => ({
+  t: 'add', hash, market, outcome, at: 0,
+  order: { user: '0x' + '77'.repeat(20), marketId: String(market), outcome: String(outcome), token: '0x' + 'c0'.repeat(20),
+           buy, price: String(price * E / 100n), size: String(5n * E), deadline: '9999999999', nonce: hash, salt: hash, postOnly: false, ioc: false },
+});
+const opCancel = (hash, { market = 909, outcome = 0 } = {}) => ({ t: 'cancel', hash, market, outcome });
+const snapOf = (state) => checkpoint.snapshot(state, { shard: SHARD, index: 7, epoch: 1, prevRoot: ZERO32, offset: 7 });
+
+test('a cancel spends a sequence number, and a checkpoint has to remember it', () => {
+  const a = createShardState({});
+  a.apply(opAdd('0x' + 'a1'.repeat(32)));                       // seq 1, rests
+  a.apply(opAdd('0x' + 'a2'.repeat(32), { buy: false, price: 60n }));  // seq 2, rests
+  a.apply(opCancel('0x' + 'a1'.repeat(32)));                    // seq 3, and leaves NO trace in the resting set
+  const snap = snapOf(a);
+  assert.equal(snap.resting, 1, 'one order left resting');
+  assert.equal(snap.counters['909:0'], 3, 'the counter the cancel spent is in the file');
+
+  const b = createShardState({});
+  checkpoint.restore(b, snap);
+  assert.equal(b.bookHash(), a.bookHash(), 'the restored book commits to the same root');
+
+  // the same next order on both: this is where an inferred counter diverges
+  const next = opAdd('0x' + 'a3'.repeat(32), { buy: true, price: 40n });
+  a.apply(next); b.apply(next);
+  assert.equal(b.bookHash(), a.bookHash(), 'and still does after the next order');
+});
+
+test('a book with nothing resting still remembers what it spent', () => {
+  const a = createShardState({});
+  a.apply(opAdd('0x' + 'b1'.repeat(32)));                       // seq 1
+  a.apply(opCancel('0x' + 'b1'.repeat(32)));                    // seq 2 — the book is now empty
+  const snap = snapOf(a);
+  assert.equal(snap.resting, 0, 'nothing resting');
+  assert.equal(snap.counters['909:0'], 2, 'but the counter is kept anyway');
+
+  const b = createShardState({});
+  checkpoint.restore(b, snap);
+  const next = opAdd('0x' + 'b2'.repeat(32));
+  a.apply(next); b.apply(next);
+  assert.equal(b.bookHash(), a.bookHash(), 'an empty book restored with its counter stays in agreement');
+});
+
+test('fills spend sequence numbers too', () => {
+  const a = createShardState({});
+  a.apply(opAdd('0x' + 'c1'.repeat(32), { buy: false, price: 40n }));   // seq 1, rests on the ask
+  const r = a.apply(opAdd('0x' + 'c2'.repeat(32), { buy: true, price: 50n }));  // seq 2, crosses → a fill bumps it again
+  assert.ok(r.fills.length > 0, 'the taker crossed');
+  const snap = snapOf(a);
+
+  const b = createShardState({});
+  checkpoint.restore(b, snap);
+  const next = opAdd('0x' + 'c3'.repeat(32), { buy: true, price: 20n });
+  a.apply(next); b.apply(next);
+  assert.equal(b.bookHash(), a.bookHash(), 'the fill\'s sequence number is not lost');
+});
+
+test('a counter below the newest order it restored is refused', () => {
+  const a = createShardState({});
+  a.apply(opAdd('0x' + 'd1'.repeat(32)));
+  a.apply(opAdd('0x' + 'd2'.repeat(32), { buy: false, price: 60n }));
+  const snap = snapOf(a);
+  snap.counters['909:0'] = 1;                                   // below the second order's seq 2
+  const b = createShardState({});
+  assert.throws(() => checkpoint.restore(b, snap), /below the newest restored order/);
+});
+
+test('a v1 checkpoint is refused rather than restored with a counter it does not carry', () => {
+  const a = createShardState({});
+  a.apply(opAdd('0x' + 'e1'.repeat(32)));
+  const snap = snapOf(a);
+  snap.v = 1;
+  const dir = tmp();
+  checkpoint.write(dir, SHARD, snap);
+  assert.equal(checkpoint.read(dir, SHARD), null, 'read() refuses the older format');
+});
+
+test('bootstrap: a shard no vote can settle is recovered on the sequencer signature, not the engine word', async () => {
+  const dir = tmp();
+  const r = await rig(dir, { orders: 40, batchMax: 5, epochBatches: 4 });
+  // a checkpoint is only meaningful at an epoch boundary: that is the only batch that commits to a book
+  const at = [...r.sealed].reverse().find((b) => b.bookHash && b.bookHash !== ZERO32);
+  assert.ok(at, 'the rig sealed at least one epoch boundary');
+  const snap = checkpoint.snapshotOfBooks([{ market: Number(SHARD), outcome: 0, m: r.state.books.get(`${SHARD}:0`) }], {
+    shard: SHARD, index: at.index, epoch: at.epoch, prevRoot: at.prevRoot,
+    offset: at.index, seq: r.state.stat().seq, bookHash: at.bookHash, commit: null,
+  });
+  const opts = { threshold: 2, ordersTopic, votesTopic: (sh) => `votes.${sh}` };
+  // no votes exist at all: this is the state the live shards were in
+  const plain = await checkpoint.verifyAgainstLog(r.log, SHARD, snap, opts);
+  assert.equal(plain.ok, false, 'without votes it is refused, as before');
+  assert.match(plain.why, /agreeing vote/);
+
+  const boot = await checkpoint.verifyAgainstLog(r.log, SHARD, snap, { ...opts, bootstrap: true, sequencers: [r.seqAcct.address] });
+  assert.equal(boot.ok, true, 'and accepted on the sequencer signature when bootstrapping');
+  assert.equal(boot.bootstrap, true);
+  assert.equal(String(boot.sequencer).toLowerCase(), r.seqAcct.address.toLowerCase());
+
+  // bootstrap is still not a free pass: a different sequencer is refused
+  const wrong = await checkpoint.verifyAgainstLog(r.log, SHARD, snap, { ...opts, bootstrap: true, sequencers: ['0x' + '99'.repeat(20)] });
+  assert.equal(wrong.ok, false, 'a batch not signed by an allowed sequencer is refused even bootstrapping');
+  assert.match(wrong.why, /not signed by a known sequencer/);
+
+  // and a forged book is still refused, because the batch commits to the real one
+  const forged = { ...snap, bookHash: '0x' + 'ab'.repeat(32) };
+  const bad = await checkpoint.verifyAgainstLog(r.log, SHARD, forged, { ...opts, bootstrap: true, sequencers: [r.seqAcct.address] });
+  assert.equal(bad.ok, false, 'bootstrap does not weaken the book-commitment check');
+  try { await r.seq.stop(); } catch { }
+});
