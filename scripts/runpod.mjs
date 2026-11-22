@@ -12,6 +12,7 @@
 // available when this was changed was rejected ("Subject token is invalid or expired"), so the first run with a
 // working key should expect to adjust them.
 const API = process.env.RUNPOD_API_BASE || 'https://api.runpod.io/v2';
+// paths are relative to API; the v2 surface keeps /pods, /pods/:id and adds /catalog/cpus and /catalog/gpus
 const key = () => { const k = process.env.RUNPOD_API_KEY; if (!k) throw new Error('RUNPOD_API_KEY missing'); return k; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -22,12 +23,31 @@ async function call(method, path, body) {
   return d;
 }
 
-/// a CPU pod from a public image. ports: ['9092/tcp'] gets a public ip:port, ['8080/http'] a proxy URL.
+/// a pod from a public image. ports: ['9092/tcp'] gets a public ip:port, ['8080/http'] a proxy URL.
+///
+/// The v2 body is NOT the v1 body, and the rename is not cosmetic — v1's fields are rejected outright
+/// ("additional properties ... not allowed"). The mapping, from the published schema:
+///
+///   imageName          → image
+///   containerDiskInGb  → disk                     (integer GB, ephemeral)
+///   dockerStartCmd     → cmd        (string[])     exec form
+///   dockerEntrypoint   → entrypoint (string[])     exec form
+///   cloudType          → cloud      'SECURE' | 'COMMUNITY', defaults SECURE
+///   computeType + cpuFlavorIds + vcpuCount  → cpu: { id, vcpuCount }     both required
+///   computeType + gpuTypeIds + gpuCount     → gpu: { id, count }         id required
+///   env, ports         unchanged
+///
+/// `gpu` makes this a GPU pod. The miner image is CPU-only and runs anywhere; GPU hosts are simply what RunPod
+/// has most of when the CPU fleet in the default data centres is empty, which is why that path exists at all.
 export async function createPod({ name, image, env = {}, ports = ['8080/http'], vcpu = 2, flavor = 'cpu3c', cloud = 'SECURE', diskGb = 10, cmd = null, entrypoint = null, publicIp = false, gpu = null }) {
-  // gpu: a GPU type id (e.g. 'NVIDIA GeForce RTX 3090') makes this a GPU pod — the miner image is CPU-only but runs anywhere;
-  // GPU hosts are what RunPod has most of when the CPU fleet in the default data centers is empty
-  const compute = gpu ? { computeType: 'GPU', gpuTypeIds: [gpu], gpuCount: 1, minVCPUPerGPU: Math.max(2, vcpu) } : { computeType: 'CPU', cpuFlavorIds: [flavor], vcpuCount: vcpu };
-  const body = { name, imageName: image, ...compute, cloudType: cloud, containerDiskInGb: diskGb, volumeInGb: 0, ports, env, supportPublicIp: publicIp || ports.some((p) => p.endsWith('/tcp')), ...(cmd ? { dockerStartCmd: cmd } : {}), ...(entrypoint ? { dockerEntrypoint: entrypoint } : {}) };
+  const asArray = (v) => (v == null ? null : Array.isArray(v) ? v.map(String) : String(v).split(' ').filter(Boolean));
+  const body = {
+    name, image, disk: Number(diskGb), ports, env,
+    cloud: String(cloud || 'SECURE').toUpperCase(),
+    ...(gpu ? { gpu: { id: gpu, count: 1 } } : { cpu: { id: flavor, vcpuCount: Number(vcpu) } }),
+    ...(cmd ? { cmd: asArray(cmd) } : {}),
+    ...(entrypoint ? { entrypoint: asArray(entrypoint) } : {}),
+  };
   const d = await call('POST', '/pods', body);
   return { id: d.id, name, costPerHr: d.costPerHr ?? null };
 }
@@ -41,7 +61,9 @@ export async function podInfo(id) {
   const d = await r.json().catch(() => ({})); const rt = d?.data?.pod?.runtime || null;
   return { ...rest, runtime: rt, uptime: rt?.uptimeInSeconds ?? -1, runtimePorts: rt?.ports || null };
 }
-export const listPods = async () => (await call('GET', '/pods')) || [];
+/// v2 answers { pagination, pods: [...] } rather than a bare array, and `sweep` iterates what this returns — so
+/// getting this wrong means a sweep that silently finds nothing and leaves rented pods running and billing.
+export const listPods = async () => { const d = await call('GET', '/pods'); return Array.isArray(d) ? d : (d && Array.isArray(d.pods) ? d.pods : []); };
 export async function terminatePod(id) { try { await call('DELETE', `/pods/${id}`); return true; } catch (e) { if (/404|not found/i.test(e.message)) return false; throw e; } }
 
 /// wait until the pod runs and its port mappings are known (RunPod assigns the public ip:port after boot)
