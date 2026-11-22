@@ -4,7 +4,14 @@
 // address of a '<port>/tcp' mapping (ip:port) or the proxy URL of a '<port>/http' one.
 // Env: RUNPOD_API_KEY. Every pod this module creates is named `miner-*` or `broker-*` so a sweep can
 // find and kill strays: `node scripts/runpod.mjs sweep` terminates every pod with those prefixes.
-const API = 'https://rest.runpod.io/v1';
+// rest.runpod.io is NXDOMAIN as of 2026-11-22 — not blocked, GONE: Cloudflare's and Google's own resolvers both
+// return NXDOMAIN for it, so every call this module made failed at DNS. The live surface that answers and
+// understands `authorization: Bearer <rpa_…>` is api.runpod.io/v2 (it returns a proper 401 for a bad key rather
+// than a 404). Override with RUNPOD_API_BASE if RunPod moves it again.
+// NOTE: the paths below (/pods, /pods/:id) are carried over unchanged and are UNVERIFIED against v2 — the key
+// available when this was changed was rejected ("Subject token is invalid or expired"), so the first run with a
+// working key should expect to adjust them.
+const API = process.env.RUNPOD_API_BASE || 'https://api.runpod.io/v2';
 const key = () => { const k = process.env.RUNPOD_API_KEY; if (!k) throw new Error('RUNPOD_API_KEY missing'); return k; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

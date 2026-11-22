@@ -98,6 +98,16 @@ if [ -n "$SHARDS" ]; then ENVS+=(--env "L3_SHARDS=$SHARDS" --env "L3_ENGINE_URL=
 fly deploy --config "$HERE/fly.toml" --app "$APP" --image "$IMAGE" --ha=false \
   --vm-size "$SIZE" --vm-memory "$MEMORY" "${ENVS[@]}"
 
+# 6. the size, APPLIED and CHECKED. `fly deploy --vm-size` loses to the `[[vm]]` block in the config file, silently:
+# a miner deployed with SIZE=performance-8x came up as shared-cpu-2x, which on a shared CPU is throttled to a few
+# hundred signatures a second and leaves the miner permanently behind the log while looking perfectly healthy. It
+# cost a benchmark run to notice, so this scales explicitly afterwards and then says what it actually got.
+if [ "$SIZE" != "shared-cpu-2x" ] || [ "$MEMORY" != "1024" ]; then
+  fly scale vm "$SIZE" --vm-memory "$MEMORY" -a "$APP" >/dev/null 2>&1 || echo "warning: could not scale $APP to $SIZE" >&2
+fi
+GOT=$(fly machine list -a "$APP" 2>/dev/null | grep -oE '(shared|performance)-cpu-[0-9]+x:[0-9]+MB|performance-[0-9]+x:[0-9]+MB' | head -1)
+echo "machine size: ${GOT:-unknown} (asked for $SIZE / ${MEMORY}MB)"
+
 echo
 echo "joined. health: fly ssh console -a $APP -C \"curl -s http://127.0.0.1:8080/healthz\""
 echo "send the operator this address so your votes count and your µROLLA is credited: $ADDR"
