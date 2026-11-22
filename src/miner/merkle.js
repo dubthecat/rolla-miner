@@ -57,6 +57,22 @@ const NIB = new Int8Array(128).fill(-1);
 for (let c = 48; c <= 57; c++) NIB[c] = c - 48;          // 0-9
 for (let c = 97; c <= 102; c++) NIB[c] = c - 87;         // a-f
 for (let c = 65; c <= 70; c++) NIB[c] = c - 55;          // A-F
+/// 0x hex → bytes written straight into `dst` at `at`, returning how many landed. `bytes()` allocates a fresh
+/// Uint8Array and `h.slice(2)` a fresh string; an order leaf does that four times (hash, user, signer, signature),
+/// and allocation is what stops the sequencer scaling across cores — 33 % of linear on 8 vCPU against 72 % for
+/// signature verification, which allocates far less per order.
+function hexInto(dst, at, h) {
+  const s = typeof h === 'string' ? h : String(h ?? '');
+  const from = (s.charCodeAt(0) === 48 && (s.charCodeAt(1) | 32) === 120) ? 2 : 0;
+  const n = s.length - from;
+  if (n & 1) throw new Error(`not hex: ${s.slice(0, 20)}`);
+  for (let i = from, j = at; i < s.length; i += 2, j++) {
+    const hi = NIB[s.charCodeAt(i) & 127], lo = NIB[s.charCodeAt(i + 1) & 127];
+    if (hi < 0 || lo < 0) throw new Error(`not hex: ${s.slice(0, 20)}`);
+    dst[j] = (hi << 4) | lo;
+  }
+  return n >> 1;
+}
 /// bytes → 0x hex, without going through Buffer
 export function hex(b) {
   let s = '0x';
@@ -98,7 +114,15 @@ class Words {
   /// a right-aligned value of `len` bytes in a 32-byte word (uint*, address, bool, bytesN<32 are LEFT-aligned —
   /// see bytes32() — so this is the uint/address/bool case)
   uint(v, len = 32) {
-    this.need(32); const off = this.i + 32 - len;
+    this.need(32);
+    // Zero the whole word before writing part of it. The number path below stops as soon as the value is
+    // exhausted and the bigint path writes only its own bytes, which was safe while every Words was freshly
+    // allocated and is NOT once the writer is reused: a `false` or a 0 writes nothing at all, so the word would
+    // keep whatever the previous leaf left there. That is a leaf that depends on the leaf before it — the same
+    // orders hashing to different roots on the sequencer and on a miner, which is a fork and not a bug report.
+    // Found by interleaving the old and new implementations in one process: 251 of 500 leaves matched.
+    this.b.fill(0, this.i, this.i + 32);
+    const off = this.i + 32 - len;
     if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) {            // seq, epoch, index, flags
       let x = v;
       for (let k = len - 1; k >= 0 && x > 0; k--) { this.b[off + k] = x & 255; x = Math.floor(x / 256); }
@@ -109,7 +133,6 @@ class Words {
       // except at absurd magnitudes, so the common case writes eight bytes and zeroes the rest: a quarter of the
       // BigInt work for exactly the same bytes, which `merkle.test.mjs` pins against the long way round.
       if (len === 32 && x >= 0n && x <= 0xffffffffffffffffn) {
-        this.b.fill(0, off, off + 24);
         for (let k = off + 31; k >= off + 24; k--) { this.b[k] = Number(x & 0xffn); x >>= 8n; }
       } else {
         for (let k = len - 1; k >= 0; k--) { this.b[off + k] = Number(x & 0xffn); x >>= 8n; }
@@ -118,20 +141,44 @@ class Words {
     this.i += 32; return this;
   }
   bool(v) { return this.uint(v ? 1 : 0, 1); }
-  address(a) { const u = bytes(a); if (u.length !== 20) throw new Error(`address: ${a}`); this.need(32); this.b.set(u, this.i + 12); this.i += 32; return this; }
+  address(a) {
+    this.need(32); const off = this.i; this.b.fill(0, off, off + 32);
+    if (a instanceof Uint8Array) { if (a.length !== 20) throw new Error(`address: ${a}`); this.b.set(a, off + 12); }
+    else if (hexInto(this.b, off + 12, a) !== 20) throw new Error(`address: ${a}`);
+    this.i += 32; return this;
+  }
   /// bytes32 occupies the word left-aligned; a shorter bytesN is right-padded. Takes hex OR raw bytes, so a
   /// caller that already has a hash as bytes (keccak256 answers bytes) need not hex it only for this to parse it
   /// straight back — that round trip was ~3 µs of every order leaf.
-  bytes32(h) { const u = h instanceof Uint8Array ? h : bytes(h); if (u.length > 32) throw new Error(`bytes32 too long: ${u.length}`); this.need(32); this.b.set(u, this.i); this.i += 32; return this; }
+  bytes32(h) {
+    this.need(32); const off = this.i; this.b.fill(0, off, off + 32);
+    if (h instanceof Uint8Array) { if (h.length > 32) throw new Error(`bytes32 too long: ${h.length}`); this.b.set(h, off); }
+    else { const n = hexInto(this.b, off, h); if (n > 32) throw new Error(`bytes32 too long: ${n}`); }
+    this.i += 32; return this;
+  }
   done() { return this.b.subarray(0, this.i); }
+  /// Rewind for another leaf. Only safe where `done()`'s bytes are consumed before the next reset — `orderLeaf`
+  /// and `fillLeaf` hash them on the spot, which is the whole reason a scratch writer is allowed there. Anything
+  /// that HANDS the bytes to a caller (restingLeafBytes) must keep its own.
+  reset() { this.i = 0; return this; }
 }
 export { Words as AbiWords };            // rewards.js builds its claim leaves with the same packer
+// Scratch writers for the two leaves whose bytes are hashed on the spot. A fresh Words per call allocated a
+// 256-byte buffer every time, and the sequencer builds one leaf per order — the allocation, not the arithmetic,
+// is what kept it at 33 % of linear across cores. `reset()` rewinds and every word is zeroed as it is written, so
+// nothing leaks from the leaf before. These are module-scoped because a leaf is built synchronously and never
+// re-entrantly; a worker thread gets its own module instance, which is exactly the isolation wanted here.
+const SCRATCH_ORDER = new Words(9), SCRATCH_FILL = new Words(8);
+// and one buffer for tagged(): prefix + payload, grown as needed rather than allocated per hash
+let TAGBUF = new Uint8Array(512);
+
 /// keccak256(prefix ‖ payload) — the leaf/node/root constructor
 export function tagged(tag, ...parts) {
   let n = 1; for (const p of parts) n += p.length;
-  const b = new Uint8Array(n); b[0] = tag; let o = 1;
-  for (const p of parts) { b.set(p, o); o += p.length; }
-  return keccak256(b);
+  if (TAGBUF.length < n) TAGBUF = new Uint8Array(Math.max(n, TAGBUF.length * 2));
+  TAGBUF[0] = tag; let o = 1;
+  for (const p of parts) { TAGBUF.set(p, o); o += p.length; }
+  return keccak256(TAGBUF.subarray(0, n));
 }
 
 // ------------------------------------------------------------------ leaves
@@ -149,7 +196,7 @@ export function fillLeaf(f) {
 export function orderLeaf(op) {
   const add = op.t !== 'cancel';
   const o = op.order || {};
-  const w = new Words(9)
+  const w = SCRATCH_ORDER.reset()
     .uint(add ? 1 : 2, 1)
     .bytes32(op.hash)
     .address(add ? o.user : (op.user || o.user || '0x' + '00'.repeat(20)))
