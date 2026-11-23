@@ -502,3 +502,19 @@ test('a batch is found by its index even when the log offsets have drifted from 
   assert.equal(found.offset, pickOffset + SKEW, 'and reports where it really sits');
   try { await r.seq.stop(); } catch { }
 });
+
+test('a checkpoint written while this miner was dissenting carries that on its face', () => {
+  const a = createShardState({});
+  a.apply(opAdd('0x' + 'f1'.repeat(32)));
+  const clean = snapOf(a);
+  assert.equal(clean.dissents, undefined, 'snapshot() itself does not invent the field');
+  // the miner stamps it (miner.js writeCheckpoint), and `read` must carry it back so start() can see it
+  const dir = tmp();
+  checkpoint.write(dir, SHARD, { ...clean, dissents: 7 });
+  const back = checkpoint.read(dir, SHARD);
+  assert.ok(back, 'the file still reads');
+  assert.equal(Number(back.dissents), 7, 'and says it was written with dissents on record');
+  // and one written in agreement is unmarked, so it is used first
+  checkpoint.write(dir, SHARD, { ...clean, dissents: 0 });
+  assert.equal(Number(checkpoint.read(dir, SHARD).dissents), 0);
+});

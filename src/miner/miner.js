@@ -241,11 +241,20 @@ export function createMiner({
   const CHECKPOINT_URL = env.L3_CHECKPOINT_URL || env.L3_ENGINE_URL || '';
   const CHECKPOINT_BOOTSTRAP = String(env.L3_CHECKPOINT_BOOTSTRAP ?? '1') !== '0';
   const CHECKPOINT_FETCH_MS = Math.max(1000, Number(env.L3_CHECKPOINT_FETCH_MS || 15000));
+  /// how a local checkpoint describes its own provenance, for the line that says why it was set aside
+  const cp0Dissents = (snap) => (snap && snap.dissents == null ? 'does not say whether it was written in agreement' : `was written with ${snap.dissents} dissent(s) on record`);
+
   function writeCheckpoint(bookHash) {
     if (!dir || !CHECKPOINT_EVERY) return;
     const t0 = Date.now();
     try {
+      // `dissents` is the honest label on this file. A checkpoint is SELF-checking — it carries the bookHash its
+      // own restored book must reproduce — and that is not the same as being right: a miner whose book had
+      // drifted from the venue's wrote a checkpoint of the drifted book, restored it on every restart because it
+      // passed its own check, and never asked the venue for a better one. That is how miner-1 stayed on three
+      // halted shards after the counters were fixed and a verifiable checkpoint was sitting on the engine.
       const snap = checkpoint.snapshot(state, { shard, index, epoch, prevRoot, offset, bookHash: bookHash && bookHash !== ZERO32 ? bookHash : null });
+      snap.dissents = m.dissents;
       checkpoint.write(dir, shard, snap);
       cpStats.written++; cpStats.lastAt = new Date(t0).toISOString(); cpStats.lastIndex = index; cpStats.ms += Date.now() - t0;
     } catch (e) { cpStats.lastWhy = e.message; logFn(`[l3miner] ${shard}: could not write a checkpoint (${e.message})`); }
@@ -492,6 +501,16 @@ export function createMiner({
     // check apiece. It is self-checking — the file carries the bookHash the restored book has to reproduce — and
     // a refusal is not a problem, it just means doing what we did before.
     let cp = CHECKPOINT_EVERY && dir ? checkpoint.read(dir, shard) : null;
+    // Our own file, written while we disagreed with the venue, is the last thing to resume from: it restores the
+    // disagreement. Keep it only as the fallback if the venue has nothing we can verify.
+    // Absent counts as unknown, not as clean: files written before this field existed were written by exactly the
+    // code that could drift, and asking the venue costs one request and a verification against the log.
+    let tainted = null;
+    if (cp && !(Number(cp.dissents) === 0)) {
+      tainted = cp; cp = null;
+      const why = cp0Dissents(tainted);
+      logFn(`[l3miner] ${shard}: the local checkpoint ${why} — asking the venue for one before trusting our own`);
+    }
     // No local one? Ask the venue for the book at a finalised epoch boundary, and then CHECK it: the batch it
     // names is signed by the sequencer and voted on by the miners, so the log settles whether this book is the
     // one the venue agreed on. Nobody's word is taken for it — a checkpoint that does not line up is simply not
@@ -520,6 +539,8 @@ export function createMiner({
         logFn(`[l3miner] ${shard}: no usable checkpoint from the venue (${e.message}) — catching up from the log`);
       }
     }
+    // the venue had nothing usable: our own tainted file still beats replaying a log whose front may be gone
+    if (!cp && tainted) { cp = tainted; logFn(`[l3miner] ${shard}: the venue had nothing usable, falling back to the local checkpoint (it ${cp0Dissents(tainted)})`); }
     if (cp) {
       try {
         const t0 = Date.now();
