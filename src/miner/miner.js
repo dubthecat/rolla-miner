@@ -509,7 +509,10 @@ export function createMiner({
         const canBootstrap = CHECKPOINT_BOOTSTRAP && allowSeq && (!quorum || quorum.finalIndex < 0);
         const v = await checkpoint.verifyAgainstLog(log, shard, got, { threshold, ordersTopic, votesTopic, bootstrap: canBootstrap, sequencers: allowSeq ? [...allowSeq] : null });
         if (!v.ok) throw new Error(v.why);
-        cp = got;
+        // the offset the batch ACTUALLY sits at, which is not always its index: the writer records the index
+        // because it has nothing better, and a shard whose log was ever re-appended drifts (shard 19085 is 528
+        // apart). Resuming from the recorded number would re-read or, worse, skip.
+        cp = (v.offset != null && Number.isFinite(Number(v.offset))) ? { ...got, offset: Number(v.offset) } : got;
         cpStats.fetched++; cpStats.fetchMs = Date.now() - t0;
         logFn(`[l3miner] ${shard}: took a checkpoint at batch ${got.index} from ${CHECKPOINT_URL} — the log confirms its book commitment and ${v.votes} miner(s) voted for that batch`);
       } catch (e) {

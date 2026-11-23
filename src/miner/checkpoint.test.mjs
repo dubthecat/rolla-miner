@@ -467,3 +467,38 @@ test('bootstrap: a shard no vote can settle is recovered on the sequencer signat
   assert.equal(bad.ok, false, 'bootstrap does not weaken the book-commitment check');
   try { await r.seq.stop(); } catch { }
 });
+
+test('a batch is found by its index even when the log offsets have drifted from it', async () => {
+  const dir = tmp();
+  // enough batches that a skew of 40 does not simply clamp to the start of the log
+  const r = await rig(dir, { orders: 300, batchMax: 5, epochBatches: 4 });
+  const topic = ordersTopic(SHARD);
+  const head = await r.log.offset(topic);
+  const all = await r.log.read(topic, 0, 1000);
+  assert.ok(all.length > 50, `the rig sealed ${all.length} batches, need > 50`);
+  const pickRow = all[all.length - 10];
+  const pick = pickRow.value, pickOffset = Number(pickRow.offset);
+  // the honest case first
+  const direct = await checkpoint.locateBatch(r.log, topic, Number(pick.index), { head });
+  assert.ok(direct, 'found it');
+  assert.equal(Number(direct.batch.index), Number(pick.index));
+
+  // now a log whose offsets are SHIFTED from its indices, which is what the live venue looks like after a restart
+  // that re-appended: reading at offset === index lands on the wrong batch entirely.
+  const SKEW = 40;                       // larger than the eight-row window, which is the whole point
+  const shifted = {
+    offset: async () => head + SKEW,
+    read: async (t, from, limit) => {
+      const at = Math.max(0, Number(from) - SKEW);
+      return (await r.log.read(t, at, limit)).map((row) => ({ offset: Number(row.offset) + SKEW, value: row.value }));
+    },
+  };
+  const naive = await shifted.read(topic, Number(pick.index), 8);
+  assert.ok(!naive.map((x) => x.value).some((v) => Number(v.index) === Number(pick.index)),
+    'the fixed window at offset === index does NOT contain the batch — this is the bug');
+  const found = await checkpoint.locateBatch(shifted, topic, Number(pick.index));
+  assert.ok(found, 'bisection finds it anyway');
+  assert.equal(Number(found.batch.index), Number(pick.index));
+  assert.equal(found.offset, pickOffset + SKEW, 'and reports where it really sits');
+  try { await r.seq.stop(); } catch { }
+});

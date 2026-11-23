@@ -171,6 +171,48 @@ export function snapshotOfBooks(books, { shard, index, epoch, prevRoot, offset, 
  * substitute for the quorum, which starts counting again at the very next batch. It is allowed only when the
  * shard has no finality to lose (`finalIndex < 0`) and only against an explicit sequencer allowlist.
  */
+/**
+ * locateBatch(log, topic, index) → { batch, offset } | null
+ *
+ * Where a batch actually SITS, rather than where it ought to. Everything here used to assume that a batch's index
+ * and its log offset are the same number — one append per batch from offset zero, which is true of a shard that
+ * has only ever been sequenced once. The live venue is not that: on shard 19085 batch 24,479 sits at offset
+ * ~25,007, a drift of 528 from a restart that re-appended, and the checkpoint written for it recorded 24,479 as
+ * its offset because the sequencer had nothing better to hand. A fixed eight-row window at the wrong place then
+ * contains none of the batch it is looking for, so EVERY checkpoint was refused with "the log has no batch N" —
+ * a true statement about where it looked, and false about the log.
+ *
+ * Indices are monotonic in a single-sequencer log, so the offset can be found by bisection: ~15 reads for 25,000
+ * batches, against a replay of the whole shard. The obvious place is tried first, because it is usually right.
+ */
+export async function locateBatch(log, topic, index, { head = null } = {}) {
+  const want = Number(index);
+  const indexAt = (rows) => { const r = rows.find((x) => x.value && Number(x.value.index) === want); return r ? { batch: r.value, offset: Number(r.offset) } : null; };
+  let hi;
+  try { hi = head == null ? Number(await log.offset(topic)) : Number(head); } catch { return null; }
+  if (!Number.isFinite(hi) || hi <= 0) return null;
+  // 1. where it would be if nothing had ever drifted
+  try {
+    const direct = await log.read(topic, Math.max(0, Math.min(want, hi - 1)), 8);
+    const got = indexAt(direct);
+    if (got) return got;
+  } catch { }
+  // 2. bisect on the index carried by whatever sits at each offset
+  let lo = 0, steps = 0;
+  while (lo <= hi && steps++ < 48) {
+    const mid = Math.floor((lo + hi) / 2);
+    let rows = [];
+    try { rows = await log.read(topic, mid, 4); } catch { return null; }
+    if (!rows.length) { hi = mid - 1; continue; }          // past the end, or a gap
+    const got = indexAt(rows);
+    if (got) return got;
+    const here = Number(rows[0].value && rows[0].value.index);
+    if (!Number.isFinite(here)) return null;
+    if (here < want) lo = mid + 1; else hi = mid - 1;
+  }
+  return null;
+}
+
 export async function verifyAgainstLog(log, shard, snap, { threshold = 2, ordersTopic, votesTopic, sequencers = null, bootstrap = false } = {}) {
   if (!snap) return { ok: false, why: 'nothing to verify' };
   const index = Number(snap.index);
@@ -178,9 +220,9 @@ export async function verifyAgainstLog(log, shard, snap, { threshold = 2, orders
   // Offsets and indices coincide for a single-sequencer shard — one append per batch (sequencer.js resume()) —
   // but the batch is matched by its own `index`, not by where it sat, so a log that ever differs is caught here
   // rather than trusted.
-  let rows = [];
-  try { rows = await log.read(ordersTopic(shard), Math.max(0, index), 8); } catch (e) { return { ok: false, why: `cannot read the log: ${e.message}` }; }
-  const batch = rows.map((r) => r.value).find((v) => v && Number(v.index) === index && String(v.shard) === String(shard));
+  let found = null;
+  try { found = await locateBatch(log, ordersTopic(shard), index); } catch (e) { return { ok: false, why: `cannot read the log: ${e.message}` }; }
+  const batch = found && String(found.batch.shard) === String(shard) ? found.batch : null;
   if (!batch) return { ok: false, why: `the log has no batch ${index} for shard ${shard}` };
   if (String(batch.bookHash || '') !== String(snap.bookHash || '')) {
     return { ok: false, why: `batch ${index} commits to ${String(batch.bookHash).slice(0, 12)}…, the checkpoint says ${String(snap.bookHash).slice(0, 12)}…` };
@@ -196,14 +238,17 @@ export async function verifyAgainstLog(log, shard, snap, { threshold = 2, orders
     if (String(v.batchRoot) !== String(batch.batchRoot)) continue;
     if (v.miner) agreed.add(String(v.miner).toLowerCase());
   }
-  if (agreed.size >= threshold) return { ok: true, why: null, votes: agreed.size, batchRoot: batch.batchRoot };
+  // the offset the batch ACTUALLY sits at, so a restoring miner resumes from the right place rather than from
+  // whatever the writer guessed (see locateBatch)
+  const at = found.offset;
+  if (agreed.size >= threshold) return { ok: true, why: null, votes: agreed.size, batchRoot: batch.batchRoot, offset: at };
   if (bootstrap) {
     // the sequencer's own signature over the root that commits to this book
     const allow = new Set([...(sequencers || [])].map((a) => String(a).toLowerCase()));
     if (!allow.size) return { ok: false, why: `batch ${index} has ${agreed.size} agreeing vote(s) and bootstrap has no sequencer allowlist to check against`, votes: agreed.size };
     const who = batch.sig ? recoverDigestSigner(batch.batchRoot, batch.sig) : null;
     if (who && allow.has(String(who).toLowerCase())) {
-      return { ok: true, why: `bootstrap: ${agreed.size} agreeing vote(s), below the threshold of ${threshold}, accepted on the sequencer's signature over batch ${index}`, votes: agreed.size, batchRoot: batch.batchRoot, bootstrap: true, sequencer: who };
+      return { ok: true, why: `bootstrap: ${agreed.size} agreeing vote(s), below the threshold of ${threshold}, accepted on the sequencer's signature over batch ${index}`, votes: agreed.size, batchRoot: batch.batchRoot, bootstrap: true, sequencer: who, offset: at };
     }
     return { ok: false, why: `batch ${index} has ${agreed.size} agreeing vote(s) and is not signed by a known sequencer (${who || 'no signature'})`, votes: agreed.size };
   }
