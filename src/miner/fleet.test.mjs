@@ -255,3 +255,89 @@ test('an engine the fleet has never reached is still a 503: it does not know wha
   assert.equal(fleet.status().starting, false);
   await fleet.stop();
 });
+
+// ------------------------------------------------------------------ dividing the shards between the fleet
+// Why this matters more than it looks: with every miner running every shard, the replication factor IS the miner
+// count, so venue capacity — (cores x per-core verify rate) / replication — does not move when a miner is added.
+// A fourth miner verifies everything a fourth time and the venue goes no faster. Holding R fixed and dividing the
+// shards is what turns a new machine into throughput.
+const ADDRS = Array.from({ length: 9 }, (_, i) => '0x' + String(i + 1).padStart(2, '0').repeat(20));
+
+/// a fleet that only pretends to mine, so the shard SET is what is under test
+function listFleet({ me, roster, replicas, shards, assign, fixed = [] }) {
+  const made = new Map();
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ markets: shards.map((s) => ({ market: Number(s), outcome: 0 })), miners: roster, replicas }) });
+  const fleet = createFleet({
+    newMiner: (s) => { const m = { start: async () => m, stop: async () => {}, status: () => ({ index: -1, votes: 0, dissents: 0, resting: 0, lagSeconds: 0, votesPending: 0, batches: 0, stalled: null, errors: 0 }), metrics: () => ({}), quorum: null };
+      made.set(s, m); return m; },
+    static: fixed, engineUrl: 'http://engine.test/', pollMs: 0, address: me, fetchImpl, logger: () => {},
+    env: { L3_SHARD_ASSIGN: assign ? '1' : '0', L3_SHARD_REPLICAS: String(replicas) },
+  });
+  return fleet;
+}
+
+test('assignment off: the fleet wants every shard the engine lists, as it always has', async () => {
+  const shards = Array.from({ length: 30 }, (_, i) => String(19000 + i));
+  const fleet = listFleet({ me: ADDRS[0], roster: ADDRS, replicas: 3, shards, assign: false });
+  await fleet.reconcile();
+  assert.equal(fleet.shards().length, 30);
+  assert.equal(fleet.status().assign.on, false);
+  await fleet.stop();
+});
+
+test('assignment on with a roster of 9 and R=3: this miner takes about a third of the shards', async () => {
+  const shards = Array.from({ length: 30 }, (_, i) => String(19000 + i));
+  const fleet = listFleet({ me: ADDRS[0], roster: ADDRS, replicas: 3, shards, assign: true });
+  await fleet.reconcile();
+  const mine = fleet.shards().length;
+  const a = fleet.status().assign;
+  assert.equal(a.on, true);
+  assert.equal(a.roster, 9);
+  assert.equal(a.everyone, false, 'a roster bigger than R must divide');
+  // ideal is 3*30/9 = 10, capped a little above
+  assert.ok(mine >= 5 && mine <= 14, `took ${mine} of 30, expected around 10`);
+  assert.equal(a.under, 0, 'every shard is still covered three times');
+  await fleet.stop();
+});
+
+test('every shard is covered exactly R times across the whole roster, and none is orphaned', async () => {
+  const shards = Array.from({ length: 30 }, (_, i) => String(19000 + i));
+  const counts = new Map(shards.map((s) => [s, 0]));
+  for (const me of ADDRS) {
+    const fleet = listFleet({ me, roster: ADDRS, replicas: 3, shards, assign: true });
+    await fleet.reconcile();
+    for (const s of fleet.shards()) counts.set(s, counts.get(s) + 1);
+    await fleet.stop();
+  }
+  for (const [s, n] of counts) assert.equal(n, 3, `shard ${s} is covered ${n} time(s), not 3`);
+  // 90 placements over 9 miners, and the venue verifies each order 3 times rather than 9
+});
+
+test('a roster no bigger than R divides nothing: three miners is exactly today', async () => {
+  const shards = Array.from({ length: 29 }, (_, i) => String(19000 + i));
+  const three = ADDRS.slice(0, 3);
+  for (const me of three) {
+    const fleet = listFleet({ me, roster: three, replicas: 3, shards, assign: true });
+    await fleet.reconcile();
+    assert.equal(fleet.shards().length, 29, 'every shard, as the live fleet does now');
+    assert.equal(fleet.status().assign.everyone, true);
+    await fleet.stop();
+  }
+});
+
+test('a miner not on the roster keeps mining everything rather than nothing', async () => {
+  const shards = Array.from({ length: 20 }, (_, i) => String(19000 + i));
+  const fleet = listFleet({ me: '0x' + 'ee'.repeat(20), roster: ADDRS, replicas: 3, shards, assign: true });
+  await fleet.reconcile();
+  assert.equal(fleet.shards().length, 20, 'an unknown miner must not silently stop working');
+  await fleet.stop();
+});
+
+test('L3_SHARDS is never divided away: an explicitly named shard stays', async () => {
+  const shards = Array.from({ length: 30 }, (_, i) => String(19000 + i));
+  // '7' is not in the engine's list and is named statically; it must survive the assignment
+  const fleet = listFleet({ me: ADDRS[0], roster: ADDRS, replicas: 3, shards, assign: true, fixed: ['7'] });
+  await fleet.reconcile();
+  assert.ok(fleet.shards().includes('7'), 'the operator asked for this one by name');
+  await fleet.stop();
+});

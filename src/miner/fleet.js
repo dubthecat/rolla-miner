@@ -22,6 +22,7 @@
 // stalled miner, a dissent, or votes the log refuses is 503; an idle shard (no batch for an hour) is fine — the
 // engine simply has nothing to sequence there.
 import http from 'node:http';
+import { shardsFor } from './assign.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -52,7 +53,7 @@ export function shardsOfMarkets(markets, { byOutcome = false } = {}) {
  *   fetchImpl        fetch (tests inject one)
  *   address          the miner's address, for /healthz and the metric labels
  */
-export function createFleet({ newMiner, static: staticShards = [], engineUrl = null, pollMs = 60000, byOutcome = false, fetchImpl = globalThis.fetch, logger: logFn = console.log, address = '', pollTimeoutMs = 15000, journalDir = null, journalRetainDays = 7, journalSweepMs = 6 * 3600000, now = Date.now } = {}) {
+export function createFleet({ newMiner, static: staticShards = [], engineUrl = null, pollMs = 60000, byOutcome = false, fetchImpl = globalThis.fetch, logger: logFn = console.log, address = '', pollTimeoutMs = 15000, journalDir = null, journalRetainDays = 7, journalSweepMs = 6 * 3600000, now = Date.now, env = process.env } = {}) {
   if (typeof newMiner !== 'function') throw new Error('a fleet needs newMiner(shard)');
   const url = engineUrl ? String(engineUrl).replace(/\/+$/, '') : null;
   const fixed = parseShards(staticShards.join ? staticShards.join(',') : staticShards);
@@ -104,6 +105,13 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
     return jstats;
   }
   let timer = null, jtimer = null, stopping = false, started = false, chain = Promise.resolve(), ready = false;
+  // Dividing the shards between the fleet's miners instead of giving every shard to every miner. Off by default:
+  // turning it on changes nothing until the roster is bigger than the replication factor (with three miners and
+  // R=3 the assignment is "everyone runs everything", which is exactly today), and it is the engine that publishes
+  // the roster, so a fleet that cannot see one keeps the old behaviour.
+  const ASSIGN = String(env.L3_SHARD_ASSIGN ?? '0') === '1';
+  const REPLICAS = Math.max(1, Number(env.L3_SHARD_REPLICAS || 3));
+  const astats = { on: ASSIGN, replicas: REPLICAS, roster: 0, everyone: null, mine: 0, held: [], under: 0, lastAt: 0 };
 
   /// the shards wanted right now: the static list plus whatever the engine lists (or last listed, on a failed poll)
   async function wanted() {
@@ -115,6 +123,8 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const d = await r.json();
         stats.listed = shardsOfMarkets(d?.markets, { byOutcome });
+        stats.roster = Array.isArray(d?.miners) ? d.miners.map((a) => String(a).toLowerCase()).filter(Boolean) : [];
+        if (Number(d?.replicas) > 0) astats.replicas = Math.max(1, Number(d.replicas));
         stats.lastPollOk = Date.now(); stats.lastPollError = null;
       } catch (e) {
         stats.pollErrors++; stats.lastPollError = e?.message || String(e);
@@ -123,7 +133,24 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
       stats.lastPoll = Date.now();
       for (const s of stats.listed) set.add(s);
     }
-    return set;
+    if (!ASSIGN) return set;
+    // Our slice of them. `fixed` (L3_SHARDS) is never divided: a shard named explicitly is one this operator asked
+    // for, and the assignment has no business taking it away.
+    const roster = stats.roster || [];
+    if (!roster.length || !roster.includes(String(address).toLowerCase())) {
+      astats.roster = roster.length; astats.everyone = true; astats.mine = set.size; astats.held = []; astats.lastAt = Date.now();
+      return set;                                   // not on the roster, or no roster published: behave as before
+    }
+    const divisible = [...set].filter((x) => !fixed.includes(String(x)));
+    const r = shardsFor(address, { shards: divisible, miners: roster, replicas: astats.replicas, running: [...miners.keys()].filter((x) => !fixed.includes(String(x))) });
+    const out = new Set([...fixed, ...r.mine]);
+    Object.assign(astats, { roster: roster.length, everyone: r.everyone, mine: out.size, held: r.held, under: r.under.length, lastAt: Date.now() });
+    if (r.added.length || r.dropped.length || r.held.length) {
+      logFn(`[l3fleet] assignment: ${out.size} of ${set.size} shard(s) are mine across ${roster.length} miner(s) at R=${astats.replicas}` +
+        `${r.added.length ? ` · +${r.added.length}` : ''}${r.dropped.length ? ` · -${r.dropped.length}` : ''}` +
+        `${r.held.length ? ` · holding ${r.held.length} nobody else covers yet` : ''}${r.under.length ? ` · ${r.under.length} under-replicated` : ''}`);
+    }
+    return out;
   }
 
   async function startShard(shard, source) {
@@ -223,7 +250,7 @@ export function createFleet({ newMiner, static: staticShards = [], engineUrl = n
     const up = started && (!url || stats.lastPollOk > 0);
     const shards = {}; let ok = up;
     for (const [shard, e] of miners) { const st = shardStatus(shard, e); shards[shard] = st; if (!st.ok) ok = false; }
-    return { ok, starting: up && !ready, miner: address, shards, count: miners.size, static: fixed, engine: url ? { url, listed: stats.listed, lastPoll: stats.lastPoll, lastPollOk: stats.lastPollOk, polls: stats.polls, pollErrors: stats.pollErrors, lastPollError: stats.lastPollError, pollMs } : null,
+    return { ok, starting: up && !ready, miner: address, shards, count: miners.size, static: fixed, assign: { ...astats }, engine: url ? { url, listed: stats.listed, lastPoll: stats.lastPoll, lastPollOk: stats.lastPollOk, polls: stats.polls, pollErrors: stats.pollErrors, lastPollError: stats.lastPollError, pollMs } : null,
              started: stats.started, stopped: stats.stopped, startFailures: stats.startFailures, ready, uptime: process.uptime(),
              journals: journalDir ? { dir: journalDir, retainDays: journalRetainDays, ...jstats } : null };
   }

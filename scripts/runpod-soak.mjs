@@ -57,7 +57,15 @@ async function rent(opts) {
   }
   throw new Error(`no capacity for ${opts.name}: ${last && last.message.slice(0, 120)}`);
 }
-async function up(p, needPorts = []) { const info = await waitRunning(p.id, { timeoutMs: 420000, needPorts }); return Object.assign(p, info); }
+/// `waitRunning` does not always hand back a `url`, and every /results fetch here sits inside a catch — so a
+/// missing url made the whole run silent: the waves still ramped, the generators still worked, and the
+/// orchestrator reported nothing and computed no scaling. Set it explicitly from the port mapping.
+async function up(p, needPorts = []) {
+  const info = await waitRunning(p.id, { timeoutMs: 420000, needPorts });
+  Object.assign(p, info);
+  if (!p.url) p.url = endpoint(p, 8080) || `https://${p.id}-8080.proxy.runpod.net`;
+  return p;
+}
 
 async function teardown() {
   if (flag('--keep')) { say('--keep: LEAVING', pods.length, 'pod(s) RUNNING AND BILLING:', pods.map((p) => p.id).join(' ')); return; }
@@ -65,7 +73,12 @@ async function teardown() {
   for (const p of pods) { try { await terminatePod(p.id); n++; } catch (e) { say('terminate FAILED', p.id, e.message.slice(0, 70)); } }
   say(`terminated ${n}/${pods.length} pod(s) — run \`node scripts/runpod.mjs sweep\` if any failed`);
 }
-process.on('SIGINT', async () => { await teardown(); process.exit(130); });
+// SIGINT *and* SIGTERM: a plain `kill` is not Ctrl-C, and with only SIGINT handled it killed the orchestrator
+// outright and left every rented pod running. Both, and SIGHUP, because the cost of missing one is a bill.
+let dying = false;
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, async () => { if (dying) process.exit(130); dying = true; say(`[${sig}] tearing down`); await teardown(); process.exit(130); });
+}
 
 /// the broker, advertising the public address RunPod gave it. Redpanda from 26.3 refuses non-loopback clients
 /// unless protected_mode is off, and that is a CLUSTER property, so it is seeded in the bootstrap file before the

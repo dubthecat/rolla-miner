@@ -153,3 +153,43 @@ test('measured: feeding the tree per op and per 2,000-op batch, JS and native', 
   console.log(`  native tree  ${(nat.x.ms * 1000 / nat.x.ops).toFixed(1)} µs per event · ${(nat.flushMs / nat.batches).toFixed(1)} ms per ${BATCH}-op batch (${(nat.flushMs * 1000 / nat.x.applied).toFixed(0)} µs per applied update, one round trip each) · root ${nat.rootUs.toFixed(0)} µs · whole run ${nat.total.toFixed(0)} ms`);
   console.log(`  bookhash     root over ${bh.resting} resting: ${(bh.rootUs / 1000).toFixed(1)} ms (${(bh.rootUs / bh.resting).toFixed(0)} µs a leaf) — what every epoch boundary cost before`);
 });
+
+// ------------------------------------------------------------------ the flip: why it has to be cluster-wide
+// `bookhash` hashes the whole resting set at every epoch boundary, and that is O(resting): measured on the dev
+// box, one boundary costs 31 ms at 1,000 resting orders, 126 ms at 5,000, 518 ms at 20,000 and 1,680 ms at
+// 60,000 — an event-loop stall on the sequencer AND on every miner, at the exact moment the venue is busiest.
+// `tree` maintains the commitment incrementally and a boundary is a root READ: 0.005-0.56 ms across the same
+// range, three to five orders of magnitude less. That is the difference between a venue that holds a high order
+// rate and one that stutters every epoch, so the switch is the main lever left for volume.
+//
+// What makes it a COORDINATED switch rather than a setting: a treap root is not a sorted-list root, so the two
+// modes commit to different words for the same book. A miner on the other mode from its sequencer therefore
+// dissents on every epoch boundary while being entirely correct about the orders. This test pins that the
+// mismatch is VISIBLE — the roots differ, so the quorum sees a dissent — rather than silently tolerated.
+test('bookhash and tree commit to different words, so a half-flipped cluster dissents instead of drifting', () => {
+  const mk = (mode) => createCommitState({ mode, resting: () => rows, env: {} });
+  const rows = [];
+  const add = (hash, buy, price, seq) => {
+    const o = { hash, user: '0x' + '77'.repeat(20), buy, price: BigInt(price), size: 5n * 10n ** 18n, remaining: 5n * 10n ** 18n, postOnly: true, ioc: false, ts: 0, seq };
+    rows.push(o);
+    return o;
+  };
+  const a = mk('bookhash'), b = mk('tree');
+  for (let i = 1; i <= 24; i++) {
+    const o = add('0x' + i.toString(16).padStart(64, '0'), i % 2 === 0, BigInt(10 + i) * 10n ** 16n, i);
+    // `seq` rides on the matcher's RESULT, which is where commit-state reads it from (restingLeaf is keyed on it)
+    for (const cs of [a, b]) cs.applied({ fills: [], rested: true, remaining: o.remaining, seq: o.seq }, { hash: o.hash, user: o.user, buy: o.buy, price: o.price });
+  }
+  a.flush(); b.flush();
+  const ra = a.root(), rb = b.root();
+  assert.match(ra, /^0x[0-9a-f]{64}$/);
+  assert.match(rb, /^0x[0-9a-f]{64}$/);
+  assert.notEqual(ra, rb, 'the two commitments must not coincide — if they did, a half-flipped cluster would be undetectable');
+  assert.equal(a.mode, 'bookhash');
+  assert.equal(b.mode, 'tree');
+  // and each is stable: asked twice, the same word
+  a.flush(); b.flush();
+  assert.equal(a.root(), ra);
+  assert.equal(b.root(), rb);
+  a.close(); b.close();
+});

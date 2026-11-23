@@ -672,6 +672,10 @@ export function createSequencerRig({
     /// miner can check against the log instead of taking anyone's word for it (checkpoint.verifyAgainstLog).
     checkpointOf(shard) { return cpDir ? checkpoint.read(cpDir, String(shard)) : null; },
     get checkpointDir() { return cpDir; },
+    /// The miners whose votes count for this venue (L3_MINERS_ALLOW). Published on /v1/l3/markets so a fleet can
+    /// divide the shards between them at a FIXED replication factor instead of every miner running every shard —
+    /// which is what makes a new miner add throughput rather than another copy of the same work (assign.js).
+    minersAllow() { return allow.map((a) => String(a).toLowerCase()); },
     status() {
       const out = { log: logImpl ? logImpl.kind : logDown.at ? 'unavailable' : 'starting', logError: logDown.error, logAttempts: logDown.attempts, dir: logImpl?.dir || null, threshold, ...stats, shards: {} };
       for (const [k, s] of shards) out.shards[k] = { sequencer: s.seq.status(), quorum: s.quorum.status(), rewardsEpochClosed: s.closedEpoch, deferred: s.deferred.length, reconcile: s.reconcile };
