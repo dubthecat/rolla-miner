@@ -43,7 +43,7 @@ const pct = (a, q) => (a.length ? a[Math.min(a.length - 1, Math.floor(q * a.leng
 // One shard: a sequencer against the broker, an observer quorum on the shard's votes, and a generator that signs
 // its own order flow and steers its rate by how finality is keeping up.
 if (!isMainThread && workerData && workerData.role === ROLE) {
-  const { shard, brokers, batch, epoch, threshold, seqKey, book, chainId, seed, seconds, rate, restingTarget, rateMin, rateMax } = workerData;
+  const { shard, brokers, batch, epoch, threshold, seqKey, book, chainId, seed, seconds, rate, restingTarget, rateMin, rateMax, mid: MID, spread: SPREAD } = workerData;
   const SECP = createRequire(import.meta.url)('secp256k1');
   const h2b = (h) => Uint8Array.from(Buffer.from(h.slice(2), 'hex'));
   const fastSign = (keyHex, digestHex) => { const { signature, recid } = SECP.ecdsaSign(h2b(digestHex), h2b(keyHex)); return '0x' + Buffer.from(signature).toString('hex') + (27 + recid).toString(16).padStart(2, '0'); };
@@ -94,11 +94,16 @@ if (!isMainThread && workerData && workerData.role === ROLE) {
     }
     const buy = rnd() < 0.5;
     const cross = over ? rnd() < 0.85 : rnd() < 0.35;      // over the target, mostly take liquidity away
-    const mid = 50, off = Math.floor(rnd() * 20);
-    const cents = buy ? (cross ? mid + off : mid - 1 - off) : (cross ? mid - off : mid + 1 + off);
+    // Quote AROUND THIS MARKET'S FAIR PRICE rather than around 50. A workload centred on 50 produces books that
+    // look nothing like the venue's — every market priced the same, half of them nowhere near their own fair —
+    // and it hides the thing that actually costs: a book whose resting set clusters a cent or two from the mid,
+    // which is what the maker builds and what the epoch commitment has to hash.
+    const mid = MID, half = Math.max(1, SPREAD);
+    const off = 1 + Math.floor(rnd() * half * 3);          // depth: most of it near the touch, a tail further out
+    const cents = buy ? (cross ? mid + Math.ceil(off / 3) : mid - off) : (cross ? mid - Math.ceil(off / 3) : mid + off);
     const tr = traders[Math.floor(rnd() * traders.length)];
     const order = l3OrderFor({ user: tr.address, marketId: MARKET, outcome: 0, token, buy,
-      price: BigInt(Math.max(1, Math.min(99, cents))) * E / 100n, size: BigInt(1 + Math.floor(rnd() * 50)) * E, ioc: rnd() < 0.05 });
+      price: BigInt(Math.max(1, Math.min(99, Math.round(cents)))) * E / 100n, size: BigInt(1 + Math.floor(rnd() * 50)) * E, ioc: rnd() < 0.05 });
     order.nonce = BigInt(++nonce); order.salt = BigInt(++made) * 7919n + 1n;
     const ser = serializeL3Order(order);
     const hash = orderHash(domain, ser);
@@ -173,6 +178,12 @@ const R = Number(env.SOAK_REPLICAS || 3), THRESHOLD = Number(env.SOAK_THRESHOLD 
 const RATE = Number(env.SOAK_RATE || 0);                       // 0 = find it
 const RATE_MIN = Number(env.SOAK_RATE_MIN || 200), RATE_MAX = Number(env.SOAK_RATE_MAX || 40000);
 const RESTING = Number(env.SOAK_RESTING || 4000);
+// SOAK_MIDS is one fair price in cents per shard, in the same order as the shard list — scripts/market-snapshot.mjs
+// produces both from a live engine, so a soak can be run against the real open markets at their real fair prices.
+// A single value applies to every shard; missing or unparseable falls back to 50.
+const MIDS = String(env.SOAK_MIDS || '').split(',').map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0 && x < 100);
+const SPREAD = Number(env.SOAK_SPREAD || 3);
+const midFor = (i) => (MIDS.length === 0 ? 50 : MIDS.length === 1 ? MIDS[0] : (MIDS[i] ?? MIDS[MIDS.length - 1]));
 const brokers = env.L3_KAFKA_BROKERS || '127.0.0.1:9092';
 const seqKey = env.SOAK_SEQ_KEY || generatePrivateKey(), seqAddr = privateKeyToAccount(seqKey).address;
 const BOOK = env.PREDICT_BOOK || '0x7197A5160562516F6f8C4503dF03CD836a524D66', CHAIN_ID = Number(env.CHAIN_ID || 46630);
@@ -199,6 +210,7 @@ function rollup() {
 
 async function main() {
   say(`[soak] ${SHARDS.length} shard(s) ${SHARDS[0]}…${SHARDS[SHARDS.length - 1]} · ${SECONDS}s · ${R} miner(s)/shard threshold ${THRESHOLD} · rate ${RATE || 'adaptive'} · resting target ${RESTING} · broker ${brokers}`);
+  say(`[soak] books quoted around ${MIDS.length ? (MIDS.length === 1 ? MIDS[0] + 'c for every shard' : MIDS.length + ' per-shard fair price(s), ' + midFor(0) + 'c…' + midFor(SHARDS.length - 1) + 'c') : '50c (no SOAK_MIDS given)'} ± ${SPREAD}c`);
   say(`[soak] sequencer ${seqAddr}`);
   for (let r = 0; r < R; r++) {
     const keys = SHARDS.map(() => generatePrivateKey());
@@ -218,7 +230,8 @@ async function main() {
   state.running = true; state.goAt = Date.now();
   workers = SHARDS.map((shard, i) => new Worker(fileURLToPath(import.meta.url), {
     workerData: { role: ROLE, shard, brokers, batch: BATCH, epoch: EPOCH, threshold: THRESHOLD, seqKey, book: BOOK, chainId: CHAIN_ID,
-                  seed: 101 + i, seconds: SECONDS, rate: RATE, restingTarget: RESTING, rateMin: RATE_MIN, rateMax: RATE_MAX },
+                  seed: 101 + i, seconds: SECONDS, rate: RATE, restingTarget: RESTING, rateMin: RATE_MIN, rateMax: RATE_MAX,
+                  mid: midFor(i), spread: SPREAD },
   }));
   for (const w of workers) {
     w.on('message', (m) => {
