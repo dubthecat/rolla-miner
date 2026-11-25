@@ -325,18 +325,32 @@ async function main() {
       if (m.t === 'done') { state.results[m.shard] = m; if (Object.keys(state.results).length === SHARDS.length) finish(); }
     });
     w.on('error', (e) => { say(`[soak] shard thread error: ${e.message}`); state.error = e.message; });
+    // A worker that EXITS without posting 'done' used to end the run in silence: the host kept serving, every
+    // sample stayed empty, and `/results` reported nothing wrong for the whole soak. Say so, and fail loudly —
+    // a harness that cannot tell "the venue is quiet" from "the generator is dead" cannot be trusted with either.
+    w.on('exit', (code) => {
+      const shard = SHARDS[workers.indexOf(w)] ?? '?';
+      if (state.results[shard] || state.done) return;
+      state.error = `shard ${shard} generator exited (${code}) before finishing`;
+      say(`[soak] ${state.error}`);
+      if (Object.values(state.latest).length === 0) say('[soak] it never produced a sample — check PREDICT_BOOK, the broker, and L3_LOG');
+    });
   }
   // one rolled-up line a second into the series, and a readable one every 30
   setInterval(() => {
     const r = rollup(); if (!r) return;
     state.series.push(r); if (state.series.length > 4000) state.series.shift();
-    if (r.elapsed % 30 === 0) say(`[soak] ${r.elapsed}s · ${r.rate.toLocaleString()}/s (target ${r.target.toLocaleString()}) · backlog ${r.backlog} · final p50 ${r.p50}ms p90 ${r.p90}ms · resting ${r.resting.toLocaleString()} · forks ${r.forks} · dissents ${r.dissents} · halted ${r.halted} · rss ${r.rssMax}MB${r.spreadCents != null ? ` · book ${r.spreadCents}c wide, ${r.depthAtTouch} at the touch, ${r.fairDevCents}c off fair · ${r.takes.toLocaleString()} takes, ${r.makerFills.toLocaleString()} maker fills` : ''}`);
+    if (r.elapsed === 5 || r.elapsed % 30 === 0) say(`[soak] ${r.elapsed}s · ${r.rate.toLocaleString()}/s (target ${r.target.toLocaleString()}) · backlog ${r.backlog} · final p50 ${r.p50}ms p90 ${r.p90}ms · resting ${r.resting.toLocaleString()} · forks ${r.forks} · dissents ${r.dissents} · halted ${r.halted} · rss ${r.rssMax}MB${r.spreadCents != null ? ` · book ${r.spreadCents}c wide, ${r.depthAtTouch} at the touch, ${r.fairDevCents}c off fair · ${r.takes.toLocaleString()} takes, ${r.makerFills.toLocaleString()} maker fills` : ''}`);
   }, 1000);
 }
 
 /// the numbers the run is for: what it HELD, not what it peaked at
 function summary() {
-  const ser = state.series.filter((r) => r.elapsed > 60);        // drop the first minute: miners are still warming
+  // Drop the first minute — the miners are still warming — but ONLY if there is more than a minute to drop.
+  // A short run used to filter its whole series away, summary() returned null, and the run ended having printed
+  // nothing at all: no DONE line, no book, and an empty /results. Three local runs were read as a hang.
+  const all = state.series;
+  const ser = all.length > 90 ? all.filter((r) => r.elapsed > 60) : all;
   if (!ser.length) return null;
   const rates = ser.map((r) => r.rate).sort((a, b) => a - b);
   const rs = Object.values(state.results);
