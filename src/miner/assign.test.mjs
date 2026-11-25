@@ -170,3 +170,75 @@ test('an empty or single roster is not a crash', () => {
   assert.equal((one.byMiner.get(miner(1).toLowerCase()) || []).length, 5);
   assert.equal(one.under.length, 5, 'one miner cannot be three replicas, and that is reported');
 });
+
+// ------------------------------------------------------------------ how many replicas the fleet can afford
+// R is not a constant, and two A/Bs are why. Same machines, same workload, only R differing:
+//    6 miners / 12 markets / T=2:  R=6 → 11,896 orders/s flat backlog · R=3 → 2,451/s, backlog 1,185→6,703
+//   12 miners / 24 markets / T=2:  R=12 → 4,183 orders/s flat backlog · R=4 → 3,100/s, queue grew (0.74x)
+// Dividing lost both times, because at ~4,000 orders/s each miner was using 4 % of its verification capacity and
+// what finality waited on was the T-th fastest of R voters — which gets faster as R grows. Division only pays
+// once the venue's rate approaches ONE miner's capacity, and then it is the only way through.
+import { replicasFor } from './assign.js';
+
+test('a venue that fits inside one miner keeps every replica — which is what measured fastest', () => {
+  for (const [N, S, rate] of [[3, 29, 4000], [12, 24, 4000], [9, 60, 20000]]) {
+    const r = replicasFor({ miners: N, shards: S, ordersPerSec: rate, threshold: 2 });
+    assert.equal(r.replicas, N, `N=${N} S=${S} at ${rate}/s should keep R=N`);
+    assert.equal(r.need, 0);
+    assert.match(r.why, /latency-bound/);
+  }
+});
+
+test('R falls out of the formula as the rate rises, and never below the straggler floor', () => {
+  const N = 40, S = 400, T = 2;
+  let last = Infinity;
+  for (const rate of [10000, 100000, 500000, 1000000, 5000000]) {
+    const r = replicasFor({ miners: N, shards: S, ordersPerSec: rate, threshold: T });
+    assert.ok(r.replicas <= last, `R must not rise with the rate (${rate}/s gave ${r.replicas} after ${last})`);
+    assert.ok(r.replicas >= T + 2, `R=${r.replicas} is below the straggler floor at ${rate}/s`);
+    assert.ok(r.replicas <= N);
+    last = r.replicas;
+  }
+});
+
+test('every miner stays inside its verification budget whenever the formula says it fits', () => {
+  for (const [N, S, rate] of [[200, 2000, 1_000_000], [100, 1000, 400_000], [50, 500, 200_000]]) {
+    const r = replicasFor({ miners: N, shards: S, ordersPerSec: rate, threshold: 2 });
+    if (r.need) continue;                       // it already said it does not fit
+    assert.ok(r.perMinerLoad <= r.budget * 1.05, `N=${N} S=${S} at ${rate}/s: load ${Math.round(r.perMinerLoad)} over budget ${Math.round(r.budget)}`);
+  }
+});
+
+test('a million orders a second over two thousand markets fits, with replicas to spare', () => {
+  const r = replicasFor({ miners: 200, shards: 2000, ordersPerSec: 1_000_000, threshold: 2 });
+  assert.ok(r.replicas >= 4, `R=${r.replicas} leaves no straggler tolerance`);
+  assert.equal(r.need, 0, 'it should not be asking for more miners');
+  assert.ok(r.perMinerShards < 2000, 'and no miner is carrying the whole venue');
+  assert.ok(r.perMinerLoad <= r.budget, `load ${Math.round(r.perMinerLoad)} vs budget ${Math.round(r.budget)}`);
+});
+
+test('when even the straggler floor will not fit, it says how many miners would', () => {
+  const r = replicasFor({ miners: 12, shards: 100, ordersPerSec: 200_000, threshold: 2 });
+  assert.ok(r.need > 12, `need ${r.need} should exceed the roster of 12`);
+  assert.match(r.why, /needs ~/);
+  // and the number it names actually fits
+  const better = replicasFor({ miners: r.need, shards: 100, ordersPerSec: 200_000, threshold: 2 });
+  assert.ok(better.perMinerLoad <= better.budget * 1.05, `the suggested ${r.need} miners still do not fit`);
+});
+
+test('growing the fleet at a fixed rate raises R back towards everyone — more miners IS more tolerance', () => {
+  const S = 1000, rate = 300_000;
+  let last = 0;
+  for (const N of [12, 25, 50, 100, 300]) {
+    const r = replicasFor({ miners: N, shards: S, ordersPerSec: rate, threshold: 2 });
+    assert.ok(r.replicas >= last, `R should not fall as the fleet grows (N=${N} gave ${r.replicas} after ${last})`);
+    last = r.replicas;
+  }
+});
+
+test('no roster, no shards and nonsense are answered rather than thrown', () => {
+  for (const o of [{}, { miners: 0, shards: 10 }, { miners: 5, shards: 0 }, { miners: NaN, shards: NaN, ordersPerSec: NaN }]) {
+    const r = replicasFor(o);
+    assert.ok(Number.isFinite(r.replicas) && r.replicas >= 1, JSON.stringify(o));
+  }
+});

@@ -24,6 +24,13 @@ const IMAGE = arg('--image', 'ghcr.io/dubthecat/rolla-miner:latest');
 const SIM_IMAGE = arg('--sim-image', 'ghcr.io/dubthecat/rolla-miner-sim:latest');
 const BOOK = process.env.PREDICT_BOOK || '0x7197A5160562516F6f8C4503dF03CD836a524D66';
 const CHAIN_ID = String(process.env.CHAIN_ID || 46630);
+// the commitment both sides must agree on: bookhash hashes the whole resting set at every epoch boundary (O(resting)),
+// tree keeps it incrementally and a boundary is a root read. Set on the generators AND the miners, because the two
+// modes commit to different words and a half-flipped pair dissents on every boundary.
+const COMMIT = arg('--commit', '');
+// kill one miner this many seconds into each arm, and keep measuring: does finality survive losing a voter?
+const KILL_AT = Number(arg('--kill-at', 0));
+const ARMS = String(arg('--arms', 'A,B')).split(',').map((x) => x.trim().toUpperCase()).filter(Boolean);
 const SHARDS = String(arg('--shard-list', '')).split(',').map((x) => x.trim()).filter(Boolean);
 const MIDS = String(arg('--mids', '')).split(',').map((x) => x.trim()).filter(Boolean);
 if (!SHARDS.length) { console.error('--shard-list required'); process.exit(2); }
@@ -81,7 +88,7 @@ async function arm(name, perMinerIdx, BROKERS, seqKey, seqAddr, offset) {
     const sh = perMiner[i];
     const keys = sh.map(() => generatePrivateKey());
     const p = await rent({ name: `ab-${name}-m${i + 1}-${Date.now().toString(36)}`, image: IMAGE, ports: ['8080/http'], vcpu: VCPU, diskGb: 40, cmd: ['node', 'scripts/sim-miners.mjs'],
-      env: { SIM_SHARDS: sh.join(','), SIM_KEYS: keys.join(','), L3_KAFKA_BROKERS: BROKERS, L3_SEQUENCERS: seqAddr, L3_THRESHOLD: String(THRESHOLD), SIM_WORKERS: '2', PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
+      env: { SIM_SHARDS: sh.join(','), SIM_KEYS: keys.join(','), L3_KAFKA_BROKERS: BROKERS, L3_SEQUENCERS: seqAddr, L3_THRESHOLD: String(THRESHOLD), SIM_WORKERS: '2', PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID, ...(COMMIT ? { L3_COMMIT: COMMIT } : {}) } });
     pods.push(p); ms.push(p);
   }
   for (const m of ms) await up(m);
@@ -95,16 +102,25 @@ async function arm(name, perMinerIdx, BROKERS, seqKey, seqAddr, offset) {
     const p = await rent({ name: `ab-${name}-g${g + 1}-${Date.now().toString(36)}`, image: IMAGE, ports: ['8080/http'], vcpu: VCPU, diskGb: 40, cmd: ['node', 'scripts/sim-soak.mjs'],
       env: { SOAK_SECONDS: String(MINUTES * 60), SOAK_SHARD_LIST: sh.join(','), SOAK_MIDS: md.join(','), SOAK_REPLICAS: '0', SOAK_THRESHOLD: String(THRESHOLD),
              SOAK_SEQ_KEY: seqKey, SOAK_RESTING: String(RESTING), SOAK_RATE: '0', SOAK_BATCH: '500', SOAK_EPOCH: '20',
-             L3_KAFKA_BROKERS: BROKERS, L3_LOG_READER: 'native', PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
+             L3_KAFKA_BROKERS: BROKERS, L3_LOG_READER: 'native', PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID, ...(COMMIT ? { L3_COMMIT: COMMIT } : {}) } });
     pods.push(p); gens.push(p);
   }
   for (const g of gens) await up(g);
   say(`${name}: ${gens.length} generator(s) up, running ${MINUTES} min`);
 
   const track = [];
-  const until = Date.now() + MINUTES * 60 * 1000;
+  const started = Date.now();
+  const until = started + MINUTES * 60 * 1000;
+  let killed = null;
   while (Date.now() < until) {
     await sleep(60000);
+    // lose a voter on purpose. A venue whose finality stops when one miner dies is not robust, whatever its
+    // throughput was; with R voters and threshold T it should carry on as long as R-1 >= T.
+    if (KILL_AT > 0 && !killed && Date.now() - started >= KILL_AT * 1000 && ms.length > 1) {
+      const victim = ms[ms.length - 1];
+      say(`${name}: KILLING miner ${victim.id} (${perMiner[ms.length - 1].length} shard(s)) — R becomes ${(placements / shards.length).toFixed(1)}-ish minus one voter per shard it held`);
+      await kill([victim]); ms.pop(); killed = Date.now();
+    }
     const nows = [];
     for (const g of gens) { try { const r = await getJson(g.url + '/results'); if (r && r.now) nows.push(r.now); } catch { } }
     if (!nows.length) continue;
@@ -117,19 +133,25 @@ async function arm(name, perMinerIdx, BROKERS, seqKey, seqAddr, offset) {
                 backlog: sum('backlog'), resting: sum('resting'),
                 forks: sum('forks'), dissents: sum('dissents'), halted: sum('halted'), p50: p50s.length ? p50s[Math.floor(p50s.length / 2)] : null };
     track.push(t);
-    say(`${name} [${t.elapsed}s] submit ${t.rate.toLocaleString()}/s · FINALISED ${t.finalised.toLocaleString()}/s · backlog ${t.backlog} · p50 ${t.p50}ms · resting ${t.resting.toLocaleString()} · forks ${t.forks} · dissents ${t.dissents}`);
+    t.afterKill = !!killed;
+    say(`${name} [${t.elapsed}s]${killed ? ' (one miner down)' : ''} submit ${t.rate.toLocaleString()}/s · backlog ${t.backlog} · p50 ${t.p50}ms · resting ${t.resting.toLocaleString()} · forks ${t.forks} · dissents ${t.dissents} · halted ${t.halted}`);
   }
   // what it HELD: the median of the second half, so the AIMD ramp is not counted as the answer
   const half = track.slice(Math.floor(track.length / 2)).map((x) => x.finalised).sort((a, b) => a - b);
   const submitted = track.slice(Math.floor(track.length / 2)).map((x) => x.rate).sort((a, b) => a - b);
+  // "sustained" means the backlog did not grow: a rising queue is latency being borrowed, not throughput.
+  const bl = track.map((x) => x.backlog);
+  const growing = bl.length > 3 && bl[bl.length - 1] > bl[Math.floor(bl.length / 2)] * 1.5 && bl[bl.length - 1] > 200;
   const row = { name, placements, perOrderVerifications: Number((placements / shards.length).toFixed(2)),
                 submit: submitted.length ? submitted[Math.floor(submitted.length / 2)] : null,
+                sustained: !growing, backlogFirst: bl[0] ?? null, backlogLast: bl[bl.length - 1] ?? null,
+                killedAt: KILL_AT || null, forksAfterKill: track.filter((x) => x.afterKill).reduce((a, x) => a + x.forks, 0),
                 held: half.length ? half[Math.floor(half.length / 2)] : null,
                 p50: track.length ? track[track.length - 1].p50 : null,
                 backlog: track.length ? track[track.length - 1].backlog : null,
                 forks: track.length ? track[track.length - 1].forks : null, track };
   out.arms.push(row);
-  say(`${name}: FINALISED ${(row.held || 0).toLocaleString()}/s (submitted ${(row.submit || 0).toLocaleString()}/s) · p50 ${row.p50}ms · backlog ${row.backlog} · forks ${row.forks}`);
+  say(`${name}: ${(row.submit || 0).toLocaleString()} orders/s ${row.sustained ? 'SUSTAINED' : 'NOT sustained (the queue grew)'} · backlog ${row.backlogFirst}→${row.backlogLast} · p50 ${row.p50}ms · forks ${row.forks}${KILL_AT ? ` · forks after the kill ${row.forksAfterKill}` : ''}`);
   await kill([...ms, ...gens]);
   return row;
 }
@@ -144,19 +166,22 @@ try {
   await sleep(45000);
 
   const idx = SHARDS.map((_, i) => i);
+  say(`commitment ${COMMIT || 'bookhash (default)'}${KILL_AT ? ` · one miner killed ${KILL_AT}s into each arm` : ''}`);
   // arm A: every miner runs every shard, which is replication = miner count
-  await arm('A-all-shards', Array.from({ length: MINERS }, () => idx.slice()), BROKERS, seqKey, seqAddr, 0);
+  if (ARMS.includes('A')) await arm(`A-all-shards-R${MINERS}`, Array.from({ length: MINERS }, () => idx.slice()), BROKERS, seqKey, seqAddr, 0);
 
   // arm B: the same miners, replication held at R, shards divided by rendezvous hashing — on fresh ids
-  const addrs = Array.from({ length: MINERS }, (_, i) => '0x' + String(i + 1).padStart(2, '0').repeat(20));
-  const a = assign({ shards: idx.map(String), miners: addrs, replicas: R });
-  const divided = addrs.map((m) => (a.byMiner.get(m.toLowerCase()) || []).map(Number));
-  say(`assignment: ${divided.map((x) => x.length).join('/')} shard(s) per miner (cap ${a.cap}, ideal ${a.ideal.toFixed(1)})`);
-  await arm(`B-divided-R${R}`, divided, BROKERS, seqKey, seqAddr, 400000);
+  if (ARMS.includes('B')) {
+    const addrs = Array.from({ length: MINERS }, (_, i) => '0x' + String(i + 1).padStart(2, '0').repeat(20));
+    const a = assign({ shards: idx.map(String), miners: addrs, replicas: R });
+    const divided = addrs.map((m) => (a.byMiner.get(m.toLowerCase()) || []).map(Number));
+    say(`assignment: ${divided.map((x) => x.length).join('/')} shard(s) per miner (cap ${a.cap}, ideal ${a.ideal.toFixed(1)})`);
+    await arm(`B-divided-R${R}`, divided, BROKERS, seqKey, seqAddr, 400000);
+  }
 
   const [A, B] = out.arms;
-  if (A && B && A.held && B.held) {
-    say(`RESULT dividing the shards: ${(B.held / A.held).toFixed(2)}x the FINALISED rate (${A.held.toLocaleString()}/s → ${B.held.toLocaleString()}/s), backlog ${A.backlog} → ${B.backlog}`);
+  if (A && B && A.submit && B.submit) {
+    say(`RESULT dividing the shards: ${(B.submit / A.submit).toFixed(2)}x the sustained rate (${A.submit.toLocaleString()}/s → ${B.submit.toLocaleString()}/s) · sustained A=${A.sustained} B=${B.sustained}`);
     say(`verification per order went ${A.perOrderVerifications}x → ${B.perOrderVerifications}x, so the ceiling should move ~${(A.perOrderVerifications / B.perOrderVerifications).toFixed(2)}x`);
   }
   console.log('RESULT ' + JSON.stringify(out));

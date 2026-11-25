@@ -676,6 +676,10 @@ export function createSequencerRig({
     /// divide the shards between them at a FIXED replication factor instead of every miner running every shard —
     /// which is what makes a new miner add throughput rather than another copy of the same work (assign.js).
     minersAllow() { return allow.map((a) => String(a).toLowerCase()); },
+    /// every op this rig has sequenced, across every shard. Sampled over time it is the venue's order rate, which
+    /// is what decides how many replicas the fleet can afford (assign.js replicasFor).
+    opsTotal() { let n = 0; for (const [, sh] of shards) { try { n += Number(sh.seq.status().ops) || 0; } catch { } } return n; },
+    shardCount() { return shards.size; },
     status() {
       const out = { log: logImpl ? logImpl.kind : logDown.at ? 'unavailable' : 'starting', logError: logDown.error, logAttempts: logDown.attempts, dir: logImpl?.dir || null, threshold, ...stats, shards: {} };
       for (const [k, s] of shards) out.shards[k] = { sequencer: s.seq.status(), quorum: s.quorum.status(), rewardsEpochClosed: s.closedEpoch, deferred: s.deferred.length, reconcile: s.reconcile };

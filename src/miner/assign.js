@@ -170,3 +170,67 @@ export function churn(before, after) {
   }
   return moved;
 }
+
+// ---------------------------------------------------------------- how many replicas the fleet can afford
+/**
+ * replicasFor({ miners, shards, ordersPerSec, perMinerCapacity, threshold, utilisation })
+ *   → { replicas, perMinerShards, perMinerLoad, budget, need, why }
+ *
+ * R should not be a constant, and measuring it twice is what showed why. Two A/Bs on RunPod, same machines and
+ * workload, differing only in R:
+ *
+ *     6 miners, 12 markets, T=2    R=6  → 11,896 orders/s, backlog flat     R=3 → 2,451/s, backlog 1,185→6,703
+ *    12 miners, 24 markets, T=2    R=12 →  4,183 orders/s, backlog flat      R=4 → 3,100/s, queue GREW (0.74x)
+ *
+ * Dividing the shards lost both times, which is the opposite of the arithmetic about verification cost — and the
+ * arithmetic is not wrong, it is about a regime those runs were nowhere near:
+ *
+ *   LATENCY-BOUND (both runs, ~4,000 orders/s). Each miner was verifying ~4,000/s against a capacity of ~108,000/s
+ *   (8 vCPU x 13,500). Verification was 4 % of the machine; nothing was waiting on it. What finality waited on was
+ *   the T-th fastest of R voters, and that gets FASTER as R grows: with T=2, two of twelve answer sooner than two
+ *   of four. Cutting R to save work the miners were not short of simply made every batch wait longer, the backlog
+ *   grew, and the rate controller backed off. More replicas is more speed here.
+ *
+ *   CAPACITY-BOUND. When the venue's order rate approaches ONE miner's verification capacity, "every miner runs
+ *   every shard" is a wall that no number of miners moves, because every miner must verify the whole venue. At
+ *   that point dividing the shards is not an optimisation, it is the only way through — and R should be the
+ *   smallest value that still tolerates stragglers.
+ *
+ * So R is chosen, per poll, as the largest the fleet can afford without any miner exceeding a verification budget:
+ *
+ *     load(R) = (R·S/N) x r        each miner's shards x the orders/s on a shard
+ *     R       = clamp( floor(budget·N / (S·r)), threshold+2, N )
+ *
+ * At a low rate that is R = N, which is today's behaviour and the one that measured best. As the rate rises R
+ * falls out of the formula on its own, and when even R = threshold+2 will not fit, `need` says how many miners
+ * the fleet would have to have for it to fit — which is the signal to add machines rather than a silent overload.
+ */
+export function replicasFor({ miners = 0, shards = 0, ordersPerSec = 0, perMinerCapacity = 108000, threshold = 2, utilisation = 0.6 } = {}) {
+  const N = Math.max(0, Math.floor(Number(miners) || 0));
+  const S = Math.max(0, Math.floor(Number(shards) || 0));
+  const T = Math.max(1, Math.floor(Number(threshold) || 1));
+  const floorR = Math.min(Math.max(T + 2, 1), Math.max(N, 1));            // straggler tolerance, never above the roster
+  if (!N || !S) return { replicas: Math.min(floorR, Math.max(N, 1)), perMinerShards: 0, perMinerLoad: 0, budget: 0, need: 0, why: 'no roster or no shards' };
+  const budget = Math.max(1, Number(perMinerCapacity) || 1) * Math.min(1, Math.max(0.05, Number(utilisation) || 0.6));
+  const rate = Math.max(0, Number(ordersPerSec) || 0);
+  const perShard = S > 0 ? rate / S : 0;
+  // the whole venue fits inside one miner: keep every replica, because latency is what is binding and more voters
+  // answer sooner
+  if (perShard <= 0 || rate <= budget) {
+    const R = N;
+    return { replicas: R, perMinerShards: S, perMinerLoad: rate, budget, need: 0, why: rate <= budget ? 'latency-bound: the venue fits in one miner, so keep every replica' : 'no measured rate' };
+  }
+  const affordable = Math.floor((budget * N) / (S * perShard));           // = budget·N / rate
+  const R = Math.max(floorR, Math.min(N, affordable));
+  const perMinerShards = Math.ceil((R * S) / N);
+  const perMinerLoad = perMinerShards * perShard;
+  // if even the floor does not fit, say how many miners would make it fit at the floor
+  const need = perMinerLoad > budget ? Math.ceil((floorR * rate) / budget) : 0;
+  return {
+    replicas: R, perMinerShards, perMinerLoad, budget, need,
+    why: R >= N ? 'the whole venue still fits in one miner'
+      : R > floorR ? 'capacity-bound: R trimmed so every miner stays inside its verification budget'
+        : need ? `capacity-bound: even R=${floorR} does not fit — the fleet needs ~${need} miner(s)`
+          : `capacity-bound: at the straggler floor R=${floorR}`,
+  };
+}

@@ -7,8 +7,11 @@ for f in $P/native/book/commit*.cpp $P/native/book/commit*.hpp $P/native/book/co
 sed -i "s#engine/l3/miner/commit.test.mjs#src/miner/commit.test.mjs#" $R/native/book/Makefile
 sed -i "s#'../../engine/l3/miner/#'../../src/miner/#g" $R/native/book/commit_diff.mjs $R/native/book/commit_bench.mjs 2>/dev/null || true
 cp $P/engine/l3/matcher.js $R/src/matcher.js; cp $P/engine/l3/native.js $R/src/native.js; cp $P/engine/l3/matcher.test.mjs $P/engine/l3/native.test.mjs $R/src/
-mkdir -p $R/src/miner && cp $P/engine/l3/miner/*.js $P/engine/l3/miner/*.mjs $R/src/miner/ && cp $P/lib/desk.js $R/src/desk.js && cp $P/lib/state-file.js $R/src/state-file.js && sed -i "s#'../../../lib/desk.js'#'../desk.js'#g; s#'../../../lib/state-file.js'#'../state-file.js'#g" $R/src/miner/*.js $R/src/miner/*.mjs
+mkdir -p $R/src/miner && cp $P/engine/l3/miner/*.js $P/engine/l3/miner/*.mjs $R/src/miner/ && cp $P/lib/desk.js $R/src/desk.js && cp $P/lib/state-file.js $R/src/state-file.js && cp $P/lib/quote-math.js $R/src/quote-math.js && sed -i "s#'../../../lib/desk.js'#'../desk.js'#g; s#'../../../lib/state-file.js'#'../state-file.js'#g; s#'../../../lib/quote-math.js'#'../quote-math.js'#g" $R/src/miner/*.js $R/src/miner/*.mjs
 cp $P/engine/l3/restore.test.mjs $R/src/restore.test.mjs
+# the load generator's flow model and its tests: sim-soak.mjs builds the venue's own books with it, and it quotes
+# with lib/quote-math.js — the SAME arithmetic the live market maker uses, which is why that file comes over too
+cp $P/engine/l3/flow.test.mjs $R/src/flow.test.mjs
 # the native Kafka client (engine/l3/kafka → src/kafka): log.js imports it as '../kafka/…', which resolves the
 # same on both sides, so these need no rewrite — they only need to be here, or log.js cannot load at all
 mkdir -p $R/src/kafka && cp $P/engine/l3/kafka/*.js $P/engine/l3/kafka/*.mjs $R/src/kafka/
