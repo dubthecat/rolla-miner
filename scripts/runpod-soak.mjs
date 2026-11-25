@@ -38,12 +38,24 @@ const IMAGE = arg('--image', 'ghcr.io/dubthecat/rolla-miner:latest');
 const SIM_IMAGE = arg('--sim-image', 'ghcr.io/dubthecat/rolla-miner-sim:latest');
 const BOOK = process.env.PREDICT_BOOK || '0x7197A5160562516F6f8C4503dF03CD836a524D66';
 const CHAIN_ID = String(process.env.CHAIN_ID || 46630);
+// THE ORDER FLOW. The default is the venue's own makers (src/miner/flow.js quoting with src/quote-math.js, the
+// live maker's arithmetic); --flow noise is the pre-2026-11-25 random generator, for comparing against the runs
+// in docs/L3-MINERS.md. --boost is the volume dial: it scales makers and levels together.
+const FLOW_ENV = {
+  SOAK_FLOW: arg('--flow', 'makers'),
+  SOAK_MAKERS: arg('--makers', '3'), SOAK_LEVELS: arg('--levels', '3'), SOAK_BOOST: arg('--boost', '1'),
+  SOAK_TAKERS: arg('--takers', '0.35'), SOAK_INFORMED: arg('--informed', '0.2'),
+  SOAK_VOL: arg('--vol', '0.05'), SOAK_REQUOTE_MS: arg('--requote-ms', '1000'),
+  SOAK_SIZE: arg('--size', '12'), SOAK_OUTCOMES: arg('--outcomes', '2'), SOAK_CONF: arg('--conf', '0.8'),
+};
+const EXTRA = Object.fromEntries(String(arg('--extra-env', '')).split(',').filter(Boolean).map((kv) => { const i = kv.indexOf('='); return [kv.slice(0, i), kv.slice(i + 1)]; }));
 const SHARD_LIST = String(arg('--shard-list', '')).split(',').map((x) => x.trim()).filter(Boolean);
 const MIDS = String(arg('--mids', '')).split(',').map((x) => x.trim()).filter(Boolean);
 if (!SHARD_LIST.length) { console.error('--shard-list is required (node scripts/market-snapshot.mjs --env)'); process.exit(2); }
 
 const t0 = Date.now();
 const say = (...a) => console.log(`+${((Date.now() - t0) / 1000).toFixed(0)}s`, ...a);
+console.log(`flow ${FLOW_ENV.SOAK_FLOW}${FLOW_ENV.SOAK_FLOW === 'makers' ? ` · ${FLOW_ENV.SOAK_MAKERS} makers × ${FLOW_ENV.SOAK_LEVELS} levels boost ${FLOW_ENV.SOAK_BOOST} · takers ${FLOW_ENV.SOAK_TAKERS} (${FLOW_ENV.SOAK_INFORMED} informed) · vol ${FLOW_ENV.SOAK_VOL}/s · requote ${FLOW_ENV.SOAK_REQUOTE_MS}ms` : ' (the original random generator)'}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pods = [];
 const FLAVORS = ['cpu3c', 'cpu5c', 'cpu3g', 'cpu5g'];
@@ -125,7 +137,7 @@ try {
     const keys = shards.map(() => generatePrivateKey());
     const miner = await rent({ name: `soak-miner-${w}-${Date.now().toString(36)}`, image: IMAGE, ports: ['8080/http'], vcpu: VCPU, diskGb: 40, cmd: ['node', 'scripts/sim-miners.mjs'],
       env: { SIM_SHARDS: shards.join(','), SIM_KEYS: keys.join(','), L3_KAFKA_BROKERS: BROKERS, L3_SEQUENCERS: seqAddr,
-             L3_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
+             L3_THRESHOLD: String(THRESHOLD), SIM_WORKERS: String(WORKERS), ...EXTRA, PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
     pods.push(miner); await up(miner);
     row.minerId = miner.id; row.minerUpMs = Date.now() - wt;
     say(`wave ${w}: miner ${miner.id} (${miner.kind}) up in ${row.minerUpMs}ms for ${shards.length} shard(s)`);
@@ -134,6 +146,7 @@ try {
       env: { SOAK_SECONDS: String(secs), SOAK_SHARD_LIST: shards.join(','), SOAK_MIDS: mids.join(','), SOAK_REPLICAS: '0',
              SOAK_THRESHOLD: String(THRESHOLD), SOAK_SEQ_KEY: seqKey, SOAK_RESTING: String(RESTING), SOAK_RATE: String(RATE),
              SOAK_BATCH: String(BATCH), SOAK_EPOCH: String(EPOCH), L3_KAFKA_BROKERS: BROKERS, L3_LOG_READER: 'native',
+             ...FLOW_ENV, ...EXTRA,
              PORT: '8080', PREDICT_BOOK: BOOK, CHAIN_ID } });
     pods.push(gen); await up(gen);
     live.push({ wave: w, gen, miner, shards });
@@ -149,11 +162,15 @@ try {
       if (!nows.length) continue;
       const sum = (k) => nows.reduce((a, y) => a + (Number(y[k]) || 0), 0);
       const p50s = nows.map((y) => y.p50).filter((y) => y != null).sort((a, b) => a - b);
+      const med = (rows, k) => { const v = rows.map((y) => Number(y[k])).filter(Number.isFinite).sort((a, b) => a - b); return v.length ? Number(v[Math.floor(v.length / 2)].toFixed(2)) : null; };
       const t = { elapsed: Math.round((Date.now() - t0) / 1000), miners: live.length, shards: live.reduce((a, x) => a + x.shards.length, 0),
                   rate: sum('rate'), backlog: sum('backlog'), resting: sum('resting'), forks: sum('forks'), dissents: sum('dissents'),
-                  halted: sum('halted'), p50: p50s.length ? p50s[Math.floor(p50s.length / 2)] : null };
+                  halted: sum('halted'), p50: p50s.length ? p50s[Math.floor(p50s.length / 2)] : null,
+                  // the book, so a wave that sequenced beautifully into an empty market cannot pass for a result
+                  spread: med(nows, 'spreadCents'), depth: med(nows, 'depthAtTouch'), dev: med(nows, 'fairDevCents'),
+                  takes: sum('takes'), makerFills: sum('makerFills'), quotes: sum('quotes') };
       track.push(t);
-      say(`[${t.elapsed}s] ${t.miners} miner pod(s) · ${t.shards} shard(s) · ${t.rate.toLocaleString()}/s · backlog ${t.backlog} · final p50 ${t.p50}ms · resting ${t.resting.toLocaleString()} · forks ${t.forks} · dissents ${t.dissents} · halted ${t.halted}`);
+      say(`[${t.elapsed}s] ${t.miners} miner pod(s) · ${t.shards} shard(s) · ${t.rate.toLocaleString()}/s · backlog ${t.backlog} · final p50 ${t.p50}ms · resting ${t.resting.toLocaleString()} · forks ${t.forks} · dissents ${t.dissents} · halted ${t.halted}${t.spread != null ? ` · book ${t.spread}c / depth ${t.depth} / ${t.dev}c off fair · ${t.takes.toLocaleString()} takes ${t.makerFills.toLocaleString()} fills` : ''}`);
     }
     row.track = track;
     const last = track.slice(-3);
@@ -161,7 +178,9 @@ try {
     row.p50 = last.length ? last[last.length - 1].p50 : null;
     row.forks = last.length ? last[last.length - 1].forks : null;
     results.wave.push(row);
-    say(`wave ${w}: held ${(row.held || 0).toLocaleString()}/s with ${live.reduce((a, x) => a + x.shards.length, 0)} shard(s) on ${live.length} miner pod(s)`);
+    const lastT = last[last.length - 1] || null;
+    if (lastT) Object.assign(row, { spread: lastT.spread, depth: lastT.depth, dev: lastT.dev, takes: lastT.takes, makerFills: lastT.makerFills });
+    say(`wave ${w}: held ${(row.held || 0).toLocaleString()}/s with ${live.reduce((a, x) => a + x.shards.length, 0)} shard(s) on ${live.length} miner pod(s)${lastT && lastT.spread != null ? ` · books ${lastT.spread}c wide, ${lastT.dev}c off fair, ${(lastT.makerFills || 0).toLocaleString()} maker fills` : ''}`);
   }
 
   // the final word from each generator
