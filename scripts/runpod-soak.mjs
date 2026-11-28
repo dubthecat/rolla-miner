@@ -27,6 +27,11 @@ const flag = (k) => process.argv.includes(k);
 
 const MINUTES = Number(arg('--minutes', 30));
 const WAVES = Number(arg('--waves', 5));
+// --ramp: minutes each wave holds before the next arrives. --minutes is then the hold at the FULL fleet, counted from
+// the moment the last generator is up. Before 2026-11-28 the whole run shared one --minutes budget that renting ate
+// into (one miner took 266 s to boot): waves 4 and 5 got two minutes each, the early generators had already stopped,
+// and the '5 miner' figure was measured on a venue that was mostly idle.
+const RAMP = Number(arg('--ramp', 3));
 const VCPU = Number(arg('--vcpu', 8));
 const BROKER_VCPU = Number(arg('--broker-vcpu', 8));
 const RATE = Number(arg('--rate', 0));                 // 0 = each shard finds its own
@@ -109,7 +114,7 @@ const results = { minutes: MINUTES, waves: WAVES, threshold: THRESHOLD, shards: 
 
 try {
   const seqKey = generatePrivateKey(), seqAddr = privateKeyToAccount(seqKey).address;
-  say(`soak: ${MINUTES} min · ${WAVES} wave(s) of (1 miner pod + its shards) · ${SHARD_LIST.length} real market(s) · threshold ${THRESHOLD} · sequencer ${seqAddr}`);
+  say(`soak: ${RAMP} min a wave, then ${MINUTES} min at the full fleet · ${WAVES} wave(s) of (1 miner pod + its shards) · ${SHARD_LIST.length} real market(s) · threshold ${THRESHOLD} · sequencer ${seqAddr}`);
 
   const broker = await rent({ name: `soak-broker-${Date.now().toString(36)}`, image: SIM_IMAGE, ports: ['9092/tcp'], vcpu: BROKER_VCPU, diskGb: 80, cmd: brokerCmd, publicIp: true, env: {} });
   pods.push(broker); say('broker', broker.id, broker.kind, `$${broker.costPerHr}/h`);
@@ -131,7 +136,8 @@ try {
     if (!shards.length) { say(`wave ${w}: no shards left`); break; }
     const row = { wave: w, shards: shards.length, ids: shards.join(',') };
     const wt = Date.now();
-    const secs = Math.max(120, Math.floor((MINUTES * 60) - (Date.now() - t0) / 1000));
+    // every generator outlives the run: the ramp still ahead of it (with room for slow rentals), then the full hold
+    const secs = Math.round(MINUTES * 60 + (WAVES - w) * (RAMP * 60 + 420) + 300);
 
     // the miner first, so there is something to vote by the time orders arrive
     const keys = shards.map(() => generatePrivateKey());
@@ -153,7 +159,7 @@ try {
     row.genId = gen.id; row.seconds = secs;
     say(`wave ${w}: generator ${gen.id} up for ${secs}s — the venue now has ${live.reduce((a, x) => a + x.shards.length, 0)} shard(s) on ${live.length} miner pod(s)`);
 
-    const until = Date.now() + (w === WAVES ? Math.max(120000, MINUTES * 60 * 1000 - (Date.now() - t0)) : everyMs);
+    const until = Date.now() + (w === WAVES ? MINUTES : RAMP) * 60 * 1000;
     const track = [];
     while (Date.now() < until) {
       await sleep(60000);
@@ -174,6 +180,7 @@ try {
     }
     row.track = track;
     const last = track.slice(-3);
+    { const rs = track.slice(w === WAVES ? 2 : 0).map((x) => x.rate).sort((a, b) => a - b); row.median = rs.length ? rs[Math.floor(rs.length / 2)] : null; row.min = rs.length ? rs[0] : null; row.max = rs.length ? rs[rs.length - 1] : null; row.readings = rs.length; }
     row.held = last.length ? Math.round(last.reduce((a, x) => a + x.rate, 0) / last.length) : null;
     row.p50 = last.length ? last[last.length - 1].p50 : null;
     row.forks = last.length ? last[last.length - 1].forks : null;
@@ -191,6 +198,7 @@ try {
   if (ws.length > 1) {
     const a = ws[0], b = ws[ws.length - 1];
     say(`SCALING ${(b.held / a.held).toFixed(2)}x from ${a.wave} to ${b.wave} miner pod(s) — ${Math.round(100 * (b.held / a.held) / (b.wave / a.wave))}% of linear`);
+    for (const w of ws) say(`  wave ${w.wave}: ${w.shards} new shard(s) · median ${(w.median || 0).toLocaleString()}/s (min ${(w.min || 0).toLocaleString()}, max ${(w.max || 0).toLocaleString()}, ${w.readings} reading(s))`);
     say(`a million orders/s at this per-miner rate: ~${Math.ceil(1e6 / (b.held / b.wave))} miner pod(s) of ${VCPU} vCPU at threshold ${THRESHOLD}`);
   }
   console.log('RESULT ' + JSON.stringify(results));
